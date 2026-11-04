@@ -10,4 +10,4 @@ safetensors==0.8.0
 huggingface_hub==1.33.0
 sentencepiece==0.2.0
 gradio==6.31.0
-sia @ git+https://github.com/alimohammadiamirhossein/selective-image-analogy@<COMMIT>
+sia @ git+https://github.com/alimohammadiamirhossein/selective-image-analogy@8a08e92
