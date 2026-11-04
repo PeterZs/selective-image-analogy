@@ -39,6 +39,22 @@ only the kept edits to a new image **B**; the unticked edits are suppressed.
 - **Inputs:** images up to 4096 px per side and 20 megapixels.
 - **Code:** <https://github.com/alimohammadiamirhossein/selective-image-analogy>
 
+## Examples
+
+The demo has a gallery of **20 examples** from the `analogy_benchmark` split of the SIA dataset, with
+2, 3 and 4 edits, people, animals and objects, and different sets of kept edits. Clicking a card loads
+A, A', B, the edits and the kept edits, and shows the precomputed result (seed 0, 40 steps, resolution 512)
+straight away; **Run** recomputes it live. These examples were selected because the automatic judge scored
+them highly and they look right to us; results on your own images vary. Eleven of the 20 use an edit recipe
+or images that were also part of the training data (all 2-edit and all non-creature examples, plus one more;
+the app marks them when you open them); the other nine are unseen. The selection criteria and the judge
+scores are in `examples/examples.json`.
+
+The repository ships only the gallery cards and the precomputed results (`examples/cards`,
+`examples/results`). The full-resolution inputs are the dataset's original PNGs: the app downloads the
+benchmark parquet file (about 90 MB, pinned revision) from the public dataset once and reads each
+example by its case id.
+
 ## License and attribution
 
 - **Qwen.** The SIA adapters are derived from Qwen-Image-2.1 and distributed under the
@@ -47,9 +63,11 @@ only the kept edits to a new image **B**; the unticked edits are suppressed.
   LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved.
 - **No endorsement.** This demo is made by the SIA authors. It is not affiliated with or endorsed by the
   Qwen team, Alibaba, or Black Forest Labs.
-- **Example images** (`examples/`) are unchanged images from the `analogy_benchmark` split of the
+- **Example images.** The 20 examples use images from the `analogy_benchmark` split of the
   [SIA Multi-Edit Analogy dataset](https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy),
-  licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). Edited images were generated with
+  licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). The inputs are loaded unchanged
+  from the dataset; the gallery cards in `examples/cards` are downscaled composites of those images and the
+  model's result, and `examples/results` holds the model's outputs (JPEG). Edited images were generated with
   [FLUX.2 [klein]](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) and are subject to the
   [FLUX Non-Commercial License](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B/blob/main/LICENSE.md).
   The 2-edit recipes build on [Relation252K](https://huggingface.co/datasets/handsomeWilliam/Relation252K)

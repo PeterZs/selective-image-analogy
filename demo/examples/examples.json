@@ -3,16 +3,211 @@
     "dataset": "selective-image-analogy/SIA-Multi-Edit-Analogy",
     "config": "analogy_benchmark",
     "split": "test",
+    "revision": "6937d68a37b9b8d403fd4d259cc79b417d5f10d3",
+    "parquet": "data/analogy_benchmark/test-00000-of-00001.parquet",
     "url": "https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy"
   },
   "license": "CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
   "attribution": "Images from the SIA Multi-Edit Analogy dataset (Alimohammadi et al., SIGGRAPH Asia 2026), CC BY-NC 4.0. Edited images were generated with FLUX.2 [klein] (https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B), subject to the FLUX Non-Commercial License. 2-edit recipes build on Relation252K (https://huggingface.co/datasets/handsomeWilliam/Relation252K, Apache-2.0).",
-  "changes": "None: images are the dataset's original PNGs, re-encoded losslessly.",
+  "changes": "Input images are not redistributed here: the app loads the original PNGs from the dataset by case id. cards/ are downscaled composites (JPEG) of the dataset images and the model's result; results/ are the model's outputs (JPEG).",
+  "results": "SIA Qwen-Image-2.1 ExLoRA step 5000, no CSV; seed 0, 40 steps, resolution 512, resized to B's size.",
+  "selection": {
+    "script": "select_examples.py (criteria in its docstring)",
+    "judge": "automatic VLM judge scores of the benchmark evaluation (method s2_5000)",
+    "criteria": "retained accuracy, preservation and suppression >= 9, recall 1, suppression rate 1; unseen recipes and images preferred; one example per recipe family; kept and checked visually",
+    "dropped_after_visual_check": {
+      "2edits/data16:keep1": "kept edit missing: the head is still lowered ('Raise the head' not applied)",
+      "2edits_non_creature/setting3/data1:keep1": "kept edit missing: the frame does not float",
+      "3edits/setting10/data2:keep23": "not convincing: B already has a street background, so the kept background edit is invisible",
+      "3edits_non_creature/setting1/data10:keep13": "kept style only partly applied: the background stays in colour",
+      "4edits/setting3/data2:keep13": "kept edit wrong: the scarf is grey, the edit asks for a blue scarf"
+    }
+  },
   "kept_indexing": "0-based indices into edits",
   "examples": [
     {
-      "id": "3edits/setting10/data2",
-      "folder": "3edits__setting10__data2",
+      "id": "2edits/data13",
+      "folder": "2edits__data13",
+      "edits": [
+        "looks like a clown",
+        "raise arms behind head"
+      ],
+      "edit_types": [
+        "appearance",
+        "pose"
+      ],
+      "kept": [
+        0
+      ],
+      "num_edits": 2,
+      "subject_type": "creature",
+      "kept_kind": "single",
+      "recipe_in_train": false,
+      "uses_train_images": true,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/2edits__data13.jpg",
+      "result": "results/2edits__data13__result.jpg"
+    },
+    {
+      "id": "2edits/data4",
+      "folder": "2edits__data4",
+      "edits": [
+        "pencil-sketch black and white style",
+        "surprised expression"
+      ],
+      "edit_types": [
+        "style",
+        "expression"
+      ],
+      "kept": [
+        0
+      ],
+      "num_edits": 2,
+      "subject_type": "creature",
+      "kept_kind": "single",
+      "recipe_in_train": false,
+      "uses_train_images": true,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/2edits__data4.jpg",
+      "result": "results/2edits__data4__result.jpg"
+    },
+    {
+      "id": "2edits/data6",
+      "folder": "2edits__data6",
+      "edits": [
+        "beach background",
+        "oil painting style"
+      ],
+      "edit_types": [
+        "background",
+        "style"
+      ],
+      "kept": [
+        0
+      ],
+      "num_edits": 2,
+      "subject_type": "creature",
+      "kept_kind": "single",
+      "recipe_in_train": false,
+      "uses_train_images": true,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/2edits__data6.jpg",
+      "result": "results/2edits__data6__result.jpg"
+    },
+    {
+      "id": "2edits_non_creature/setting1/data1",
+      "folder": "2edits_non_creature__setting1__data1",
+      "edits": [
+        "turned-on front lights",
+        "open the front doors"
+      ],
+      "edit_types": [
+        "state",
+        "state"
+      ],
+      "kept": [
+        0
+      ],
+      "num_edits": 2,
+      "subject_type": "non_creature",
+      "kept_kind": "single",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/2edits_non_creature__setting1__data1.jpg",
+      "result": "results/2edits_non_creature__setting1__data1__result.jpg"
+    },
+    {
+      "id": "2edits_non_creature/setting2/data1",
+      "folder": "2edits_non_creature__setting2__data1",
+      "edits": [
+        "jumping",
+        "add colored pencil style"
+      ],
+      "edit_types": [
+        "pose",
+        "style"
+      ],
+      "kept": [
+        0
+      ],
+      "num_edits": 2,
+      "subject_type": "non_creature",
+      "kept_kind": "single",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/2edits_non_creature__setting2__data1.jpg",
+      "result": "results/2edits_non_creature__setting2__data1__result.jpg"
+    },
+    {
+      "id": "2edits_non_creature/setting3/data1",
+      "folder": "2edits_non_creature__setting3__data1",
+      "edits": [
+        "floating pose",
+        "add colored comic style"
+      ],
+      "edit_types": [
+        "pose",
+        "style"
+      ],
+      "kept": [
+        1
+      ],
+      "num_edits": 2,
+      "subject_type": "non_creature",
+      "kept_kind": "single",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/2edits_non_creature__setting3__data1.jpg",
+      "result": "results/2edits_non_creature__setting3__data1__result.jpg"
+    },
+    {
+      "id": "3edits/setting10/data1",
+      "folder": "3edits__setting10__data1",
       "edits": [
         "add sweater",
         "add santa hat",
@@ -24,35 +219,27 @@
         "background"
       ],
       "kept": [
-        0,
         1
       ],
+      "num_edits": 3,
       "subject_type": "creature",
-      "recipe_in_train": false
+      "kept_kind": "single",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits__setting10__data1.jpg",
+      "result": "results/3edits__setting10__data1__result.jpg"
     },
     {
-      "id": "3edits/setting3/data17",
-      "folder": "3edits__setting3__data17",
-      "edits": [
-        "add armor",
-        "add beach hat",
-        "add modern apartment kitchen background"
-      ],
-      "edit_types": [
-        "object",
-        "object",
-        "background"
-      ],
-      "kept": [
-        0,
-        2
-      ],
-      "subject_type": "creature",
-      "recipe_in_train": false
-    },
-    {
-      "id": "3edits/setting11/data4",
-      "folder": "3edits__setting11__data4",
+      "id": "3edits/setting11/data1",
+      "folder": "3edits__setting11__data1",
       "edits": [
         "add golden armor",
         "add Cowboy hat",
@@ -64,15 +251,257 @@
         "background"
       ],
       "kept": [
+        0,
+        2
+      ],
+      "num_edits": 3,
+      "subject_type": "creature",
+      "kept_kind": "all_but_one",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits__setting11__data1.jpg",
+      "result": "results/3edits__setting11__data1__result.jpg"
+    },
+    {
+      "id": "3edits/setting3/data1",
+      "folder": "3edits__setting3__data1",
+      "edits": [
+        "add armor",
+        "add beach hat",
+        "add indoor music festival stage background"
+      ],
+      "edit_types": [
+        "object",
+        "object",
+        "background"
+      ],
+      "kept": [
+        0,
+        2
+      ],
+      "num_edits": 3,
+      "subject_type": "creature",
+      "kept_kind": "all_but_one",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits__setting3__data1.jpg",
+      "result": "results/3edits__setting3__data1__result.jpg"
+    },
+    {
+      "id": "3edits/setting6/data1",
+      "folder": "3edits__setting6__data1",
+      "edits": [
+        "add cluster earings",
+        "add happy expression",
+        "add peaceful countryside road background"
+      ],
+      "edit_types": [
+        "object",
+        "expression",
+        "background"
+      ],
+      "kept": [
+        1
+      ],
+      "num_edits": 3,
+      "subject_type": "creature",
+      "kept_kind": "single",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits__setting6__data1.jpg",
+      "result": "results/3edits__setting6__data1__result.jpg"
+    },
+    {
+      "id": "3edits/setting9/data1",
+      "folder": "3edits__setting9__data1",
+      "edits": [
+        "add short beard",
+        "add surprised expression",
+        "add lake shore with reflections background"
+      ],
+      "edit_types": [
+        "object",
+        "expression",
+        "background"
+      ],
+      "kept": [
+        0,
+        2
+      ],
+      "num_edits": 3,
+      "subject_type": "creature",
+      "kept_kind": "all_but_one",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits__setting9__data1.jpg",
+      "result": "results/3edits__setting9__data1__result.jpg"
+    },
+    {
+      "id": "3edits/setting2/data1",
+      "folder": "3edits__setting2__data1",
+      "edits": [
+        "add open-top crown",
+        "add gold seamless necklace",
+        "add angry expression"
+      ],
+      "edit_types": [
+        "object",
+        "object",
+        "expression"
+      ],
+      "kept": [
+        0,
+        2
+      ],
+      "num_edits": 3,
+      "subject_type": "creature",
+      "kept_kind": "all_but_one",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits__setting2__data1.jpg",
+      "result": "results/3edits__setting2__data1__result.jpg"
+    },
+    {
+      "id": "3edits_non_creature/setting1/data1",
+      "folder": "3edits_non_creature__setting1__data1",
+      "edits": [
+        "Halloween carving",
+        "table with white candles and dark background",
+        "add black and white pencil sketch style"
+      ],
+      "edit_types": [
+        "appearance",
+        "background",
+        "style"
+      ],
+      "kept": [
+        1
+      ],
+      "num_edits": 3,
+      "subject_type": "non_creature",
+      "kept_kind": "single",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits_non_creature__setting1__data1.jpg",
+      "result": "results/3edits_non_creature__setting1__data1__result.jpg"
+    },
+    {
+      "id": "3edits_non_creature/setting2/data1",
+      "folder": "3edits_non_creature__setting2__data1",
+      "edits": [
+        "add lava to the ground",
+        "open the wings",
+        "add gold color"
+      ],
+      "edit_types": [
+        "background",
+        "state",
+        "appearance"
+      ],
+      "kept": [
+        0,
+        2
+      ],
+      "num_edits": 3,
+      "subject_type": "non_creature",
+      "kept_kind": "all_but_one",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits_non_creature__setting2__data1.jpg",
+      "result": "results/3edits_non_creature__setting2__data1__result.jpg"
+    },
+    {
+      "id": "3edits_non_creature/setting3/data10",
+      "folder": "3edits_non_creature__setting3__data10",
+      "edits": [
+        "add park metal bench",
+        "turn the light lamp to red",
+        "add oil painting style"
+      ],
+      "edit_types": [
+        "object",
+        "state",
+        "style"
+      ],
+      "kept": [
         1,
         2
       ],
-      "subject_type": "creature",
-      "recipe_in_train": false
+      "num_edits": 3,
+      "subject_type": "non_creature",
+      "kept_kind": "all_but_one",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits_non_creature__setting3__data10.jpg",
+      "result": "results/3edits_non_creature__setting3__data10__result.jpg"
     },
     {
-      "id": "3edits_non_creature/setting4/data9",
-      "folder": "3edits_non_creature__setting4__data9",
+      "id": "3edits_non_creature/setting4/data1",
+      "folder": "3edits_non_creature__setting4__data1",
       "edits": [
         "add red T-shirt",
         "sitting pose",
@@ -84,15 +513,27 @@
         "style"
       ],
       "kept": [
-        1,
-        2
+        1
       ],
+      "num_edits": 3,
       "subject_type": "non_creature",
-      "recipe_in_train": true
+      "kept_kind": "single",
+      "recipe_in_train": true,
+      "uses_train_images": false,
+      "seen_in_training": true,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/3edits_non_creature__setting4__data1.jpg",
+      "result": "results/3edits_non_creature__setting4__data1__result.jpg"
     },
     {
-      "id": "4edits/setting1/data2",
-      "folder": "4edits__setting1__data2",
+      "id": "4edits/setting1/data1",
+      "folder": "4edits__setting1__data1",
       "edits": [
         "add a celestial diadem",
         "add blue color hair",
@@ -106,15 +547,28 @@
         "style"
       ],
       "kept": [
-        0,
-        1
+        1,
+        2
       ],
+      "num_edits": 4,
       "subject_type": "creature",
-      "recipe_in_train": false
+      "kept_kind": "nonprefix",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/4edits__setting1__data1.jpg",
+      "result": "results/4edits__setting1__data1__result.jpg"
     },
     {
-      "id": "4edits/setting2/data4",
-      "folder": "4edits__setting2__data4",
+      "id": "4edits/setting2/data1",
+      "folder": "4edits__setting2__data1",
       "edits": [
         "add scarf",
         "add blond long hair wig",
@@ -128,15 +582,29 @@
         "style"
       ],
       "kept": [
-        1,
+        0,
+        2,
         3
       ],
+      "num_edits": 4,
       "subject_type": "creature",
-      "recipe_in_train": false
+      "kept_kind": "all_but_one",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/4edits__setting2__data1.jpg",
+      "result": "results/4edits__setting2__data1__result.jpg"
     },
     {
-      "id": "4edits/setting3/data2",
-      "folder": "4edits__setting3__data2",
+      "id": "4edits/setting3/data1",
+      "folder": "4edits__setting3__data1",
       "edits": [
         "add blue scarf",
         "add short white hair wig",
@@ -150,28 +618,58 @@
         "style"
       ],
       "kept": [
-        1,
-        2
+        1
       ],
+      "num_edits": 4,
       "subject_type": "creature",
-      "recipe_in_train": false
+      "kept_kind": "single",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/4edits__setting3__data1.jpg",
+      "result": "results/4edits__setting3__data1__result.jpg"
     },
     {
-      "id": "2edits_non_creature/setting3/data9",
-      "folder": "2edits_non_creature__setting3__data9",
+      "id": "4edits/setting4/data3",
+      "folder": "4edits__setting4__data3",
       "edits": [
-        "floating pose",
-        "add colored comic style"
+        "add open-top crown without jewelries",
+        "add green color hair",
+        "add paris background",
+        "addVan gogh style"
       ],
       "edit_types": [
-        "pose",
+        "object",
+        "appearance",
+        "background",
         "style"
       ],
       "kept": [
-        1
+        0,
+        2
       ],
-      "subject_type": "non_creature",
-      "recipe_in_train": true
+      "num_edits": 4,
+      "subject_type": "creature",
+      "kept_kind": "nonprefix",
+      "recipe_in_train": false,
+      "uses_train_images": false,
+      "seen_in_training": false,
+      "judge": {
+        "ret_acc": 10.0,
+        "pres": 10.0,
+        "supp": 10.0,
+        "recall": 1.0,
+        "supp_rate": 1.0
+      },
+      "card": "cards/4edits__setting4__data3.jpg",
+      "result": "results/4edits__setting4__data3__result.jpg"
     }
   ]
 }

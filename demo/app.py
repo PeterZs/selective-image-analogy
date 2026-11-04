@@ -5,12 +5,15 @@ applies only the edits you keep to B (the rest are suppressed by ExLoRA).
 Backbone: Qwen-Image-2.1 with the SIA stage-2 adapters (AnaLoRA + ExLoRA,
 step 5000). No concept suppression vector (CSV) is used.
 
-Set SIA_DEMO_STUB=1 to run the UI without a GPU or model: the "result" is B
-unchanged, which is enough to test layout, validation and examples.
+Set SIA_DEMO_STUB=1 to run the UI without a GPU or model: Run returns B
+unchanged, while the example gallery and its precomputed results work as usual.
 """
 
+import html
 import json
 import os
+import tempfile
+import threading
 from pathlib import Path
 
 import gradio as gr
@@ -164,25 +167,120 @@ def kept_choices(*raw):
     return gr.update(choices=labels)
 
 
+
+
 # ---------------------------------------------------------------------------
-# Examples
+# Examples: cards and precomputed results are bundled; the full-resolution
+# inputs are the original PNGs of the public dataset, fetched by case id.
 # ---------------------------------------------------------------------------
 
 EXAMPLES_DIR = HERE / "examples"
 EXAMPLES_META = json.loads((EXAMPLES_DIR / "examples.json").read_text())
+EXAMPLES = EXAMPLES_META["examples"]
+EXAMPLES_BY_ID = {ex["id"]: ex for ex in EXAMPLES}
+DATASET = EXAMPLES_META["source"]["dataset"]
+DATASET_REVISION = EXAMPLES_META["source"]["revision"]
+DATASET_PARQUET = EXAMPLES_META["source"]["parquet"]
+INPUT_CACHE = Path(tempfile.gettempdir()) / "sia_examples"
+_download_lock = threading.Lock()
 
 
-def example_rows():
-    """Inputs and labels of the bundled examples for ``gr.Examples``."""
-    rows, labels = [], []
-    for ex in EXAMPLES_META["examples"]:
-        d = EXAMPLES_DIR / ex["folder"]
-        edits = ex["edits"] + [""] * (MAX_EDITS - len(ex["edits"]))
-        rows.append([str(d / "a.png"), str(d / "a_prime.png"), str(d / "b.png"), *edits,
-                     [str(k + 1) for k in ex["kept"]]])
-        keep = ", ".join(ex["edits"][k] for k in ex["kept"])
-        labels.append(f"{ex['id']} — keep: {keep}")
-    return rows, labels
+def _dataset_parquet():
+    """Local path of the benchmark parquet (about 90 MB, downloaded once into the HF cache)."""
+    from huggingface_hub import hf_hub_download
+
+    with _download_lock:
+        return hf_hub_download(DATASET, DATASET_PARQUET, repo_type="dataset", revision=DATASET_REVISION)
+
+
+def example_inputs(ex):
+    """Paths of the original A, A', B PNGs of an example (cached after the first load)."""
+    folder = INPUT_CACHE / ex["folder"]
+    paths = [folder / f"{k}.png" for k in ("a", "a_prime", "b")]
+    if all(p.exists() for p in paths):
+        return paths
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(_dataset_parquet(), columns=["id", "a", "a_prime", "b"],
+                          filters=[("id", "==", ex["id"])])
+    if table.num_rows != 1:
+        raise RuntimeError(f"case {ex['id']!r} not found in {DATASET}@{DATASET_REVISION[:7]}")
+    row = table.to_pylist()[0]
+    folder.mkdir(parents=True, exist_ok=True)
+    for key, path in zip(("a", "a_prime", "b"), paths):
+        with tempfile.NamedTemporaryFile(dir=folder, delete=False, suffix=".part") as f:
+            f.write(row[key]["bytes"])           # the dataset's own bytes: inputs are reproduced exactly
+        os.replace(f.name, path)
+    return paths
+
+
+def _prefetch_dataset():
+    try:
+        _dataset_parquet()
+    except Exception as exc:  # the app still works; example inputs report the error when clicked
+        print(f"[examples] could not prefetch {DATASET}: {exc}", flush=True)
+
+
+def edit_chips(edits, kept):
+    """HTML chips: kept edits in green, suppressed edits in red and struck through."""
+    chips = []
+    for i, e in enumerate(edits):
+        cls, verb = ("sia-keep", "keep") if i in kept else ("sia-drop", "suppress")
+        chips.append(f'<span class="sia-chip {cls}">{verb}: {html.escape(e)}</span>')
+    return '<div class="sia-chips">' + "".join(chips) + "</div>"
+
+
+def example_caption(ex):
+    n, k = ex["num_edits"], len(ex["kept"])
+    return f"{n} edits, keep {k}: " + "; ".join(ex["edits"][i] for i in ex["kept"])
+
+
+EDIT_FILTERS = ["All", "2 edits", "3 edits", "4 edits"]
+
+
+def gallery_items(choice="All"):
+    """(gallery value, case ids in gallery order) for a filter choice."""
+    n = None if choice == "All" else int(choice.split()[0])
+    shown = [ex for ex in EXAMPLES if n is None or ex["num_edits"] == n]
+    return [(str(EXAMPLES_DIR / ex["card"]), example_caption(ex)) for ex in shown], [ex["id"] for ex in shown]
+
+
+def load_example(case_id):
+    """Values for A, A', B, the four edit boxes, the kept checkboxes, B' and the info text."""
+    ex = EXAMPLES_BY_ID[case_id]
+    edits = ex["edits"] + [""] * (MAX_EDITS - len(ex["edits"]))
+    kept = [str(k + 1) for k in ex["kept"]]
+    info = (f"**Example `{ex['id']}`** · precomputed result (seed 0, {DEFAULT_STEPS} steps, "
+            f"{DEFAULT_RESOLUTION}). Press **Run** to recompute it live.\n\n"
+            + edit_chips(ex["edits"], ex["kept"]))
+    if ex["seen_in_training"]:
+        info += ("\n\n*This example's edit recipe or images were also part of the training data. "
+                 "Examples without this note are unseen by the model.*")
+    try:
+        a, a_prime, b = (str(p) for p in example_inputs(ex))
+    except Exception as exc:
+        a = a_prime = b = None
+        msg = (f"Could not load this example's input images from the dataset {DATASET} ({type(exc).__name__}). "
+               "The precomputed result is shown; to run SIA, check the connection or upload your own images.")
+        gr.Warning(msg)
+        info += f"\n\n**{msg}**"
+    return [a, a_prime, b, *edits, kept, str(EXAMPLES_DIR / ex["result"]), info]
+
+
+def on_gallery_select(shown_ids, evt: gr.SelectData):
+    return load_example(shown_ids[evt.index])
+
+
+def on_filter(choice):
+    items, ids = gallery_items(choice)
+    return gr.update(value=items, selected_index=None), ids
+
+
+def example_api(case_id: str) -> dict:
+    """API view of ``load_example`` (used by the tests): edits, kept and the file paths."""
+    a, a_prime, b, e1, e2, e3, e4, kept, result, info = load_example(case_id)
+    return {"a": a, "a_prime": a_prime, "b": b, "edits": [e1, e2, e3, e4], "kept": kept,
+            "result": result, "info": info}
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +293,16 @@ HEADER = """
 pick which ones to **keep**, and SIA applies only those to **B**. The other edits are suppressed.
 
 **Built with Qwen.** This demo runs the SIA adapters on Qwen-Image-2.1.
-Non-commercial research demo.
+Non-commercial research demo. Pick an example below or upload your own images.
 """
+
+EXAMPLES_NOTE = (
+    f"**{len(EXAMPLES)} examples from the SIA benchmark.** Click a card to load it with its precomputed result. "
+    "These examples were selected because the automatic judge scored them highly and they look right to us; "
+    "results on your own images vary. "
+    f"{sum(ex['seen_in_training'] for ex in EXAMPLES)} of them use an edit recipe or images that were also part "
+    "of the training data (marked when you open them); the others are unseen."
+)
 
 FOOTER = """
 ---
@@ -215,11 +321,32 @@ images you have the right to use, and do not upload images of people without the
 to deceive, harass, or create non-consensual edits of real people.
 
 **Example images** come from the [SIA Multi-Edit Analogy dataset](https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy)
-(`analogy_benchmark` split, unchanged), licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
+(`analogy_benchmark` split; inputs are loaded unchanged from the dataset, the cards are downscaled composites),
+licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
 Edited images were generated with [FLUX.2 [klein]](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)
 (FLUX Non-Commercial License); 2-edit recipes build on
 [Relation252K](https://huggingface.co/datasets/handsomeWilliam/Relation252K) (Apache-2.0).
+The example results are outputs of this demo's model.
 """
+
+CSS = """
+.sia-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.sia-chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.9em; line-height: 1.5; }
+.sia-keep { background: #dcfce7; color: #14532d; border: 1px solid #86efac; }
+.sia-drop { background: #fee2e2; color: #7f1d1d; border: 1px solid #fca5a5; text-decoration: line-through; }
+/* Gallery: show every card at its own aspect ratio, without an inner scroll box. */
+#sia-gallery, #sia-gallery .gallery-container { height: auto !important; }
+#sia-gallery .grid-wrap { height: auto !important; max-height: none !important; overflow: visible !important; }
+#sia-gallery .thumbnail-item { aspect-ratio: 724 / 328 !important; height: auto !important; }
+#sia-gallery .caption-label { display: none; }  /* the edits are drawn on the card itself */
+@media (max-width: 760px) {
+  #sia-gallery .grid-container { grid-template-columns: 1fr !important; }
+}
+"""
+
+
+# After a card is clicked, bring the loaded inputs and the result into view.
+SCROLL_TO_INPUTS = "() => document.getElementById('sia-inputs').scrollIntoView({behavior: 'smooth', block: 'start'})"
 
 
 def build_demo():
@@ -227,20 +354,20 @@ def build_demo():
     with gr.Blocks(title="SIA: Selective Image Analogy", delete_cache=(3600, 3600)) as demo:
         gr.Markdown(HEADER)
         if STUB:
-            gr.Markdown("> **Stub mode** (`SIA_DEMO_STUB=1`): no model loaded, the result is B unchanged.")
-        with gr.Row():
-            a = gr.Image(label="A (original)", type="pil", height=320)
-            a_prime = gr.Image(label="A' (edited)", type="pil", height=320)
-            b = gr.Image(label="B (your image)", type="pil", height=320)
-            out = gr.Image(label="B' (result)", type="pil", height=320, interactive=False,
+            gr.Markdown("> **Stub mode** (`SIA_DEMO_STUB=1`): no model loaded, Run returns B unchanged.")
+        with gr.Row(elem_id="sia-inputs"):
+            a = gr.Image(label="A (original)", type="pil", height=320, min_width=150)
+            a_prime = gr.Image(label="A' (edited)", type="pil", height=320, min_width=150)
+            b = gr.Image(label="B (your image)", type="pil", height=320, min_width=150)
+            out = gr.Image(label="B' (result)", type="pil", height=320, min_width=150, interactive=False,
                            format="png")  # Gradio's default (webp) is lossy
         with gr.Row():
-            with gr.Column(scale=3):
+            with gr.Column(scale=3, min_width=280):
                 gr.Markdown("**Edits between A and A'** (2 to 4, one per box, in order)")
                 boxes = [gr.Textbox(label=f"Edit {i + 1}", max_lines=1,
                                     placeholder="e.g. add a santa hat" if i == 0 else "")
                          for i in range(MAX_EDITS)]
-            with gr.Column(scale=2):
+            with gr.Column(scale=2, min_width=280):
                 kept = gr.CheckboxGroup(
                     choices=[(f"Edit {i + 1} (empty)", str(i + 1)) for i in range(MAX_EDITS)],
                     label="Edits to keep (unticked edits are suppressed)")
@@ -248,24 +375,33 @@ def build_demo():
                     seed = gr.Number(label="Seed", value=0, precision=0, minimum=0, maximum=2**31 - 1)
                     steps = gr.Slider(label="Steps", minimum=20, maximum=50, step=1, value=DEFAULT_STEPS)
                     resolution = gr.Radio(label="Resolution (target area side)",
-                                          choices=[DEFAULT_RESOLUTION], value=DEFAULT_RESOLUTION)
+                                          choices=[str(DEFAULT_RESOLUTION)], value=str(DEFAULT_RESOLUTION))
                 btn = gr.Button("Run", variant="primary")
                 info = gr.Markdown()
+
+        gr.Markdown("## Examples")
+        gr.Markdown(EXAMPLES_NOTE)
+        items, ids = gallery_items()
+        shown_ids = gr.State(ids)
+        edit_filter = gr.Radio(EDIT_FILTERS, value="All", label="Number of edits", show_label=False)
+        gallery = gr.Gallery(value=items, columns=2, height="auto", object_fit="contain",
+                             allow_preview=False, show_label=False, buttons=[], elem_id="sia-gallery")
+        gr.Markdown(FOOTER)
 
         for box in boxes:
             box.change(kept_choices, inputs=boxes, outputs=kept, api_visibility="private")
         btn.click(run, inputs=[a, a_prime, b, *boxes, kept, seed, steps, resolution],
                   outputs=[out, info], api_name="run")
-
-        rows, labels = example_rows()
-        gr.Examples(examples=rows, inputs=[a, a_prime, b, *boxes, kept], example_labels=labels,
-                    cache_examples=False, label="Examples from the SIA benchmark",
-                    api_visibility="public")
-        gr.Markdown(FOOTER)
+        edit_filter.change(on_filter, inputs=edit_filter, outputs=[gallery, shown_ids], api_visibility="private")
+        gallery.select(on_gallery_select, inputs=shown_ids, outputs=[a, a_prime, b, *boxes, kept, out, info],
+                       api_visibility="private",
+                       ).then(None, js=SCROLL_TO_INPUTS)
+        gr.api(example_api, api_name="example")
     return demo
 
 
 demo = build_demo()
+threading.Thread(target=_prefetch_dataset, daemon=True).start()
 
 if __name__ == "__main__":
-    demo.queue(max_size=20).launch()
+    demo.queue(max_size=20).launch(css=CSS)
