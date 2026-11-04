@@ -355,8 +355,13 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 # ---------------------------------------------------------------------------
 
 def _native_wh():
-    """(w, h) from env SIA_NATIVE_RES ("1" -> 384x512, "WxH"), or None for the square 512 recipe."""
-    v = os.environ.get("SIA_NATIVE_RES", "0")
+    """Fixed image size (w, h) used for every Klein image, or None for the square recipe.
+
+    The released checkpoints were trained at the dataset's native 384x512 resolution, so that is
+    the default. Environment variable SIA_NATIVE_RES overrides it: "0" or "" selects the legacy
+    square recipe (resolution x resolution), "WxH" selects another fixed size.
+    """
+    v = os.environ.get("SIA_NATIVE_RES", "1")
     if v in ("", "0"):
         return None
     w, h = (384, 512) if v == "1" else map(int, v.lower().split("x"))
@@ -367,7 +372,7 @@ def _native_wh():
 def encode_single_image(pipe, img, cell_size=512):
     """Resize, preprocess, and VAE-encode a single PIL image. Returns (1, C, h, w) latent.
 
-    With SIA_NATIVE_RES set (1 = 384x512, or "WxH") every image is encoded at that fixed
+    Unless SIA_NATIVE_RES=0 (legacy square recipe) every image is encoded at the fixed native
     non-square size instead of cell_size x cell_size (our data is 384x512 portrait)."""
     w, h = _native_wh() or (cell_size, cell_size)
     img = resize_to_match(img, w, h)
