@@ -9,7 +9,7 @@ from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 
 
-def resolve_checkpoint(spec, revision=None) -> Path:
+def resolve_checkpoint(spec, revision=None, token=None) -> Path:
     """Return the local directory of an adapter checkpoint.
 
     Args:
@@ -18,6 +18,7 @@ def resolve_checkpoint(spec, revision=None) -> Path:
             directory takes precedence. For a Hub path only ``<subfolder>`` is downloaded into
             the HF cache.
         revision: Hub revision (branch, tag or commit) used when ``spec`` names none.
+        token: Hugging Face token for a private repo (default: the logged-in token / ``HF_TOKEN``).
 
     Returns:
         Path to the checkpoint directory (inside the HF cache for a Hub path).
@@ -34,7 +35,7 @@ def resolve_checkpoint(spec, revision=None) -> Path:
         repo_id, subfolder = "/".join(parts[:2]), "/".join(parts[2:])
         try:
             snapshot = snapshot_download(repo_id, allow_patterns=f"{subfolder}/*",
-                                         revision=spec_revision or revision)
+                                         revision=spec_revision or revision, token=token)
         except (HfHubHTTPError, LocalEntryNotFoundError, ValueError) as exc:
             reason = f"{type(exc).__name__}: {exc}"
         else:

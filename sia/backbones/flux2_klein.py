@@ -4,7 +4,9 @@ Klein encodes the chat-templated prompt with its Qwen3 text encoder, so every to
 CSV positions) is computed against that templated text. A, A' and B are VAE-encoded, packed and appended
 to the target sequence as reference images (concat mode); the transformer predicts the velocity of B'.
 """
+import hashlib
 import os
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +30,7 @@ from sia.adapters import (
     load_tensors,
     lora_mode_ctx,
 )
+from sia.concept_suppression import _build_generation_prompt, _parse_jsonl_records
 from sia.data import resize_to_match
 from sia.hf import resolve_checkpoint
 
@@ -557,3 +560,148 @@ def run_inference(pipe, tokenizer, text_encoder,
     decoded  = pipe.vae.decode(unpacked, return_dict=False)[0]
     out = pipe.image_processor.postprocess(decoded, output_type="pil")[0]
     return out.resize(image_b.size, Image.LANCZOS)
+
+
+# ---------------------------------------------------------------------------
+# Concept suppression vector (the encoder-specific part; see sia.concept_suppression)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_contrast_pairs(edit: str, pipe, n_pairs: int, device,
+                            max_new_tokens_per_pair: int = 90) -> Tuple[List[dict], int]:
+    """Ask the Qwen3 text encoder (a ``Qwen3ForCausalLM``) for ``n_pairs`` contrastive pos/neg
+    sentences about ``edit``. Sampling is not seeded.
+
+    Returns ``(records, n_requested)``; ``records`` may be shorter than requested (the caller
+    pads with ``sia.concept_suppression._fallback_pairs``).
+    """
+    text_encoder, tokenizer = pipe.text_encoder, pipe.tokenizer
+    user_prompt = _build_generation_prompt(edit, n_pairs)
+    messages = [{"role": "user", "content": user_prompt}]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    was_training = text_encoder.training
+    text_encoder.eval()
+    try:
+        gen_out = text_encoder.generate(
+            **inputs,
+            max_new_tokens=max(256, n_pairs * max_new_tokens_per_pair),
+            do_sample=True,
+            temperature=1.0,
+            top_p=0.95,
+            pad_token_id=pad_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+        )
+    finally:
+        if was_training:
+            text_encoder.train()
+
+    # Strip the prompt prefix so we only decode the model's reply.
+    generated = gen_out[0, inputs["input_ids"].shape[1]:]
+    reply = tokenizer.decode(generated, skip_special_tokens=True)
+
+    records = _parse_jsonl_records(reply)
+    return records, n_pairs
+
+
+@torch.no_grad()
+def _encode_prompt(text: str, text_encoder, tokenizer, device,
+                   max_sequence_length: int = 512) -> torch.Tensor:
+    """Run a single prompt through the same encoder path as diffusion inference."""
+    prompt_embeds = Flux2KleinPipeline._get_qwen3_prompt_embeds(
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        prompt=[text],
+        device=device,
+        max_sequence_length=max_sequence_length,
+    )
+    return prompt_embeds  # (1, seq_len, hidden_dim)
+
+
+def _style_token_indices(
+    prompt: str,
+    substr: str,
+    tokenizer,
+    max_length: int = 512,
+) -> List[int]:
+    """Token indices of a contrast pair's style identifier ``substr`` in the chat-templated
+    ``prompt``, or ``[]`` if it is missing (the pair is then skipped).
+
+    Unlike ``templated_substring_indices`` this falls back to a case-insensitive match: the pair
+    parser checks identifier containment with ``.lower()``, so "Bright" in a sentence with the
+    identifier "bright" is a valid pair.
+    """
+    try:
+        return klein_find_substring_token_indices(
+            prompt, substr, tokenizer,
+            max_length=max_length,
+        )
+    except AssertionError:
+        pass
+
+    # Case-insensitive fallback: re-locate the char span, then reuse the
+    # offset-mapping logic the canonical helper would have applied.
+    templated = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    char_start = templated.lower().find(substr.lower())
+    if char_start < 0:
+        return []
+    char_end = char_start + len(substr)
+    enc = tokenizer(
+        templated,
+        max_length=max_length,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+    )
+    offsets = enc["offset_mapping"][0].tolist()
+    out = []
+    for i, (cs, ce) in enumerate(offsets):
+        if cs == ce == 0 and i > 0:
+            continue
+        if ce > char_start and cs < char_end:
+            out.append(i)
+    return out
+
+
+@torch.no_grad()
+def steering_pool(sentence: str, style: str, pipe, device, vl_images=None,
+                  max_sequence_length: int = 512) -> Optional[torch.Tensor]:
+    """Encode ``sentence`` as at inference and mean-pool ``prompt_embeds`` over the tokens of
+    ``style``. Returns a float32 CPU vector, or ``None`` if ``style`` cannot be located.
+    ``vl_images`` is unused: the Klein text encoder sees no images."""
+    text_encoder, tokenizer = pipe.text_encoder, pipe.tokenizer
+    positions = _style_token_indices(
+        sentence, style, tokenizer, max_length=max_sequence_length)
+    if not positions:
+        return None
+    prompt_embeds = _encode_prompt(
+        sentence, text_encoder, tokenizer, device, max_sequence_length)
+    # (1, S, D) → (D,) via mean over style positions
+    pooled = prompt_embeds[0, positions, :].float().mean(dim=0).cpu()
+    return pooled
+
+
+def cache_key(edit: str, prompt: Optional[str] = None, vl_images=None) -> str:
+    """Cache folder name of a CSV direction: ``sha1(edit)``, or ``sha1(prompt + "\\0" + edit)`` in
+    in-context mode, first 12 hex digits. Must never change (cached pairs were sampled unseeded).
+    ``vl_images`` is unused: the Klein direction does not depend on the images."""
+    key = f"{prompt}\x00{edit}" if prompt else edit
+    sha = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    return sha

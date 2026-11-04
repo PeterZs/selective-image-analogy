@@ -49,7 +49,16 @@ from sia.backbones.flux2_klein import (
 from sia.prompt import build_analogy_prompt
 # Imported for its side effect: the accelerate compatibility patch must be active before models load.
 import training.train_exlora_flux2_klein  # noqa: F401
-from training.steering_dom import get_or_build_steering_vector
+from sia.backbones import flux2_klein
+from sia.concept_suppression import (
+    STEERING_MODES,
+    STEERING_SCOPES,
+    alpha_at_step,
+    apply_csv,
+    format_schedule_tag,
+    get_or_build_steering_vector,
+    parse_embedding_schedule,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -99,233 +108,6 @@ def _cell_dims(ref_img: Image.Image, cell_size: int) -> tuple:
 
 
 SCALE_VALUES = [0.0, 0.25, 0.5, 0.75, 1.0]  # overridden by --scale_values
-
-
-# ---------------------------------------------------------------------------
-# Text-embedding steering (Diffusion Sliders — Ekin & Gandelsman, arXiv:2603.17998)
-# ---------------------------------------------------------------------------
-# Paper's idea: construct a unit-norm steering direction in text-embedding space
-# from a large contrastive dataset via difference-of-means (DoM), then add
-# ``alpha * v`` to the prompt embeddings at concept-token positions.
-#
-# Here we replicate the paper's pipeline: per edit, Qwen3 generates N contrastive
-# {pos, neg, pos_style, neg_style} sentence pairs, each pair is encoded via the
-# same Qwen3 text encoder that the diffusion pipeline uses, pooled at the style-
-# identifier token positions, and averaged into a unit-norm direction.
-# See training/steering_dom.py for the generator/pool/DoM helpers.
-#
-# Multiplying by ``alpha`` and adding to the inference-prompt edit-token
-# positions gives:
-#     alpha > 0  : amplify edit_i
-#     alpha < 0  : suppress edit_i  (complements ExLoRA-based suppression)
-#     alpha = 0  : no-op (falls back to pure LoRA mode)
-# ---------------------------------------------------------------------------
-
-
-
-
-STEERING_SCOPES = ("tokens", "prompt")
-STEERING_MODES  = ("add", "ablate")
-
-
-def apply_csv(
-    prompt_embeds: torch.Tensor,
-    edit_positions: list,
-    steering_vecs: list,
-    alpha_per_edit: list,
-    scope: str = "tokens",
-    all_prompt_positions: list = None,
-    mode: str = "add",
-    max_push_norm_ratio: float = 0.0,
-    ablate_scale: float = 1.0,
-) -> torch.Tensor:
-    """Return a steered copy of ``prompt_embeds`` using the chosen steering
-    mode.
-
-    scope
-    -----
-      - ``"tokens"`` : apply only at the suppressed edit's own token positions
-        (``edit_positions[i]``). Same footprint as the ExLoRA mask.
-      - ``"prompt"`` : apply at every non-padding token position in the prompt
-        (``all_prompt_positions``).
-
-    mode
-    ----
-      - ``"add"`` (default, original behaviour):
-            x' = x + alpha * v̂
-        Pure additive push. Requires a large ``alpha`` to overcome whatever
-        component of the concept is already encoded in x.
-      - ``"ablate"`` (directional ablation + optional push):
-            x' = x - (x · v̂) v̂ + alpha * v̂
-        First projects out the component of x along v̂ — i.e. *deletes* the
-        concept from that 1-D subspace regardless of its magnitude — then
-        adds a controlled anti-push of magnitude ``alpha``. With alpha = 0
-        this is pure concept removal (Arditi et al.-style ablation). Usually
-        dramatically stronger than ``"add"`` for the same ``|alpha|``.
-
-    alpha_per_edit semantics
-    ------------------------
-    ``alpha_per_edit[i]`` controls edit ``i``:
-      - ``None``  : skip this edit entirely (no push, no ablation). Use this
-        for edits that are NOT being suppressed in the current sweep row.
-      - ``0.0``   : no additive push. In ``mode="ablate"`` this still
-        performs pure concept removal; in ``mode="add"`` it is a no-op.
-      - any other float: scaled push / push-after-ablation magnitude.
-
-    Important: passing ``alpha=0`` for a non-suppressed edit in ``"ablate"``
-    mode would *still* project its concept out of the prompt. Use ``None``
-    for edits you do not want to touch.
-
-    max_push_norm_ratio
-    -------------------
-    When > 0, clamps the push magnitude so it never exceeds
-    ``max_push_norm_ratio * ‖x_t‖`` (the norm of the embedding at each
-    token position *before* any modification). This prevents extreme
-    out-of-distribution embeddings that arise when ``|alpha|`` far exceeds
-    the embedding norm — a common cause of paradoxical concept
-    amplification (see degenerate-cache note in ``steering_dom.py``).
-    Set to 0 (default) to disable clamping.
-
-    ablate_scale
-    ------------
-    ``lambda`` of the paper's eq. (CSV): ``x' = x - lambda (x · v̂) v̂``. The
-    default 1.0 is the orthogonal projection (pure removal of the component);
-    larger values over-subtract it, which is how the paper's strengths
-    {75, ..., 300} act. Only used in ``mode="ablate"``.
-
-    v̂ must be unit-norm (which is what ``steering_dom.compute_dom_vector``
-    already produces). ``alpha`` here is the pre-multiplied value
-    ``alpha_i * embedding_scale_factor`` coming from the caller.
-
-    When multiple edits are non-None (e.g. scope=="prompt" and multiple
-    suppressed edits), each (ablate + push) is applied in sequence. If you
-    want the edit vectors to be independent, Gram-Schmidt them upstream —
-    this function treats each ``v_i`` as-is.
-    """
-    if scope not in STEERING_SCOPES:
-        raise ValueError(f"Unknown steering scope {scope!r}; "
-                         f"expected one of {STEERING_SCOPES}.")
-    if mode not in STEERING_MODES:
-        raise ValueError(f"Unknown steering mode {mode!r}; "
-                         f"expected one of {STEERING_MODES}.")
-
-    effective = [a for a in alpha_per_edit if a is not None]
-    if not effective:
-        return prompt_embeds
-    # Additive mode with all zero alphas is a no-op. Ablation mode is
-    # meaningful even at alpha==0 (pure concept removal), so don't skip.
-    if mode == "add" and not any(abs(a) > 0 for a in effective):
-        return prompt_embeds
-    if not any(v is not None for v in steering_vecs):
-        return prompt_embeds
-
-    steered = prompt_embeds.clone()
-    for positions, v, alpha in zip(edit_positions, steering_vecs, alpha_per_edit):
-        if v is None or alpha is None:
-            continue
-        if mode == "add" and alpha == 0:
-            continue  # nothing to add
-
-        if scope == "prompt":
-            target_positions = all_prompt_positions if all_prompt_positions else positions
-        else:
-            target_positions = positions
-        if not target_positions:
-            continue
-
-        v_hat = v.to(dtype=steered.dtype)
-        raw_push = (float(alpha) * v_hat) if alpha != 0 else None
-        for t in target_positions:
-            if t >= steered.shape[1]:
-                continue
-            x_t = steered[0, t, :]
-            if max_push_norm_ratio > 0 and raw_push is not None:
-                x_norm = x_t.norm().item()
-                max_mag = max_push_norm_ratio * max(x_norm, 1e-6)
-                push_mag = abs(float(alpha))
-                if push_mag > max_mag:
-                    push = (float(alpha) * max_mag / push_mag) * v_hat
-                else:
-                    push = raw_push
-            else:
-                push = raw_push
-            if mode == "ablate":
-                proj_scalar = torch.dot(x_t, v_hat)
-                x_t = x_t - ablate_scale * proj_scalar * v_hat
-            if push is not None:
-                x_t = x_t + push
-            steered[0, t, :] = x_t
-    return steered
-
-
-def parse_embedding_schedule(raw):
-    """Normalize an ``embedding_schedule`` spec into a sorted list of
-    ``(step_boundary, alpha)`` tuples.
-
-    Accepts any of:
-      - ``None`` / empty -> returns ``None``
-      - list of ``"boundary:alpha"`` strings  (CLI form)
-      - list of ``[boundary, alpha]`` pairs    (YAML form)
-      - list of ``{"until_step": b, "alpha": a}`` dicts (YAML form)
-
-    Semantics: for denoising step index ``t`` (0-indexed), the first entry with
-    ``t < boundary`` wins — i.e. piecewise-constant, left-closed / right-open.
-    """
-    if raw is None:
-        return None
-    try:
-        items = list(raw)
-    except TypeError:
-        return None
-    if not items:
-        return None
-    parsed = []
-    for it in items:
-        if isinstance(it, str):
-            s = it.strip()
-            if not s:
-                continue
-            if ":" not in s:
-                raise ValueError(
-                    f"embedding_schedule entry {it!r} must be 'step_boundary:alpha'")
-            a, b = s.split(":", 1)
-            parsed.append((int(a), float(b)))
-        elif isinstance(it, dict) or hasattr(it, "keys"):
-            boundary = it.get("until_step", it.get("step", it.get("boundary")))
-            alpha = it.get("alpha", it.get("value", it.get("weight")))
-            if boundary is None or alpha is None:
-                raise ValueError(
-                    f"embedding_schedule entry {dict(it)!r} must have "
-                    "keys 'until_step' and 'alpha'")
-            parsed.append((int(boundary), float(alpha)))
-        else:
-            seq = list(it)
-            if len(seq) != 2:
-                raise ValueError(
-                    f"embedding_schedule entry {it!r} must be a pair "
-                    "[step_boundary, alpha]")
-            parsed.append((int(seq[0]), float(seq[1])))
-    if not parsed:
-        return None
-    parsed.sort(key=lambda x: x[0])
-    return parsed
-
-
-def alpha_at_step(schedule, step_idx: int) -> float:
-    """Piecewise-constant lookup for the schedule."""
-    for boundary, alpha in schedule:
-        if step_idx < boundary:
-            return alpha
-    return schedule[-1][1]
-
-
-def format_schedule_tag(schedule) -> str:
-    """Short filename-safe descriptor for a schedule."""
-    parts = []
-    for boundary, alpha in schedule:
-        tag_a = f"{alpha:+.1f}".replace(".", "p").replace("+", "")
-        parts.append(f"{boundary}a{tag_a}")
-    return "sched_" + "_".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -715,9 +497,10 @@ def build_parser():
                         help="Number of contrastive pos/neg sentence pairs per edit that "
                              "Qwen3 generates (Diffusion-Sliders paper uses 100 via GPT-4o; "
                              "we default to 32 with a local Qwen to keep runtime modest).")
-    parser.add_argument("--steering_cache_dir", type=str, default="./steering_cache",
+    parser.add_argument("--steering_cache_dir", type=str, default=None,
                         help="Directory in which to cache generated pairs.jsonl and "
-                             "vector.pt per edit (keyed by sha1(edit)).")
+                             "vector.pt per edit (keyed by sha1(edit)); "
+                             "default ~/.cache/sia/csv/<backbone>.")
     parser.add_argument("--regen_steering", action="store_true",
                         help="Regenerate the contrastive pairs + DoM vector even if a cached "
                              "vector.pt exists for the edit.")
@@ -907,8 +690,6 @@ def main():
         print("[Steering DoM] In-context mode enabled — DoM will be computed "
               "inside the full inference prompt (causal-LM-aware).")
     if any_alpha:
-        cache_root = Path(args.steering_cache_dir).expanduser()
-        cache_root.mkdir(parents=True, exist_ok=True)
         hidden_dim = base_prompt_embeds.shape[-1]
         for i, edit_text in enumerate(args.edits):
             if not edit_positions[i]:
@@ -923,14 +704,9 @@ def main():
                     build_prompt_fn=build_analogy_prompt,
                 )
             v, meta = get_or_build_steering_vector(
-                edit=edit_text,
-                n_pairs=int(args.num_steering_pairs),
-                text_encoder=text_encoder,
-                tokenizer=tokenizer,
-                device=device,
-                cache_root=cache_root,
+                flux2_klein, edit_text, int(args.num_steering_pairs), pipe, device,
+                cache_dir=args.steering_cache_dir,
                 regen=bool(args.regen_steering),
-                max_sequence_length=max_seq_len,
                 **incontext_kwargs,
             )
             if v.shape[-1] != hidden_dim:

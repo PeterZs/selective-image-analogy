@@ -91,7 +91,6 @@ CONFIGS = {
     "s2_5000":      dict(ana=1, ex=1, csv=0),
     "s2_5000_csv":  dict(ana=1, ex=1, csv=1),
 }
-CSV_CACHE = "steering_cache_qwen21"
 
 
 def cmd_csvbuild(args):
@@ -99,9 +98,10 @@ def cmd_csvbuild(args):
     from ``--pairs`` Qwen-generated contrastive prompt pairs each (paper: 64)."""
     import training.train_exlora_flux2_klein  # noqa: F401  (accelerate compatibility shim)
     from diffusers import QwenImage21Pipeline
-    from training.steering_dom_qwen21 import get_or_build_steering_vector_qwen21
     from omegaconf import OmegaConf
     import torch
+    from sia.backbones import qwen_image21
+    from sia.concept_suppression import get_or_build_steering_vector
 
     cfg = OmegaConf.load(args.config)
     device = torch.device("cuda")
@@ -116,7 +116,7 @@ def cmd_csvbuild(args):
     t0 = time.time()
     stats = []
     for i, e in enumerate(edits):
-        v, meta = get_or_build_steering_vector_qwen21(e, args.pairs, pipe, device, Path(args.cache))
+        v, meta = get_or_build_steering_vector(qwen_image21, e, args.pairs, pipe, device, args.cache)
         stats.append(dict(edit=e, parsed=meta.get("n_parsed_from_llm"), requested=meta.get("n_requested"),
                           fallback=meta.get("used_fallback_padding"), usable=meta.get("n_usable_after_pooling"),
                           source=meta.get("source")))
@@ -133,28 +133,20 @@ def cmd_generate(args):
     from omegaconf import OmegaConf
 
     import torch
-    from training.infer_single import apply_csv
-    from training.steering_dom_qwen21 import get_or_build_steering_vector_qwen21
-    from sia.adapters import (
-        checkpoint_files,
-        inject_analora_modules,
-        inject_exlora_modules,
-        load_analora_from_peft_checkpoint,
-        load_analora_state_dict,
-        load_exlora_state_dict,
-    )
-    from sia.hf import resolve_checkpoint
+    from sia.adapters import inject_analora_modules, load_analora_from_peft_checkpoint
+    from sia.backbones import qwen_image21
     from sia.backbones.qwen_image21 import (
         ANALORA_TARGET_MODULES,
-        EXLORA_TARGET_MODULES,
         encode_prompt,
         generate_qwen21,
         harmonize_images_qwen21,
         load_pipeline_qwen21,
         prepare_conditions,
         qwen21_find_substring_token_indices,
-        qwen21_text_token_mask,
     )
+    from sia.concept_suppression import apply_csv, get_or_build_steering_vector
+    from sia.hf import resolve_checkpoint
+    from sia.inference import attach_adapters, encode_analogy, generate_selective
     from sia.prompt import build_analogy_prompt
 
     cfg = OmegaConf.load(args.config)
@@ -173,17 +165,11 @@ def cmd_generate(args):
 
     pipe = load_pipeline_qwen21(cfg.pretrained_model_name_or_path)
     transformer = pipe.transformer
-    if ana or ex:
-        inject_analora_modules(transformer, ANALORA_TARGET_MODULES, r=rank, alpha=rank, dropout=0.0)
     if args.analora:
+        inject_analora_modules(transformer, ANALORA_TARGET_MODULES, r=rank, alpha=rank, dropout=0.0)
         load_analora_from_peft_checkpoint(transformer, resolve_checkpoint(args.analora), device="cpu")
     elif ana or ex:
-        analora_file, exlora_file = checkpoint_files(resolve_checkpoint(args.ckpt))
-        if ana:
-            load_analora_state_dict(transformer, analora_file, "cpu")
-    if ex:
-        inject_exlora_modules(transformer, EXLORA_TARGET_MODULES, r=rank, alpha=rank, dropout=0.0)
-        load_exlora_state_dict(transformer, exlora_file)
+        attach_adapters(qwen_image21, transformer, resolve_checkpoint(args.ckpt), rank, analora=ana, exlora=ex)
     print(f"[{args.name}] AnaLoRA={ana} ExLoRA={ex} CSV={csv}  ckpt={args.ckpt or args.analora}", flush=True)
     pipe.to(device)
     transformer.eval()
@@ -202,6 +188,7 @@ def cmd_generate(args):
         print(f"[{args.name}] restricted to {len(allowed)} items from {args.items_file}", flush=True)
 
     # ---- analogy_benchmark: every retained subset -------------------------
+    # The per-item path (sia.inference.encode_analogy + generate_selective) is the one the demo runs.
     cases = load_split(args.split, args.limit, args.dataset)[args.shard_index::args.num_shards]
     for ci, case in enumerate(cases):
         edits = case["edits"]
@@ -211,35 +198,27 @@ def cmd_generate(args):
             todo = [k for k in todo if (case["id"], keep_tag(k)) in allowed]
         if not todo:
             continue
-        a, a_prime, b = harmonize_images_qwen21(case["a"], case["a_prime"], case["b"], case["b"])[:3]
-        cond = prepare_conditions(pipe, [a, a_prime, b], resolution, device)
-        full_prompt = build_analogy_prompt(edits, edits)
-        if ex or csv:                     # these keep the full prompt; suppression happens elsewhere
-            embeds, pad = encode_prompt(pipe, full_prompt, cond, device)
+        analogy = encode_analogy(pipe, case["a"], case["a_prime"], case["b"], edits, resolution, device)
         if csv:
-            positions = [qwen21_find_substring_token_indices(pipe, full_prompt, e, cond.image_sizes) for e in edits]
-            built = [get_or_build_steering_vector_qwen21(e, args.csv_pairs, pipe, device, Path(args.csv_cache))
+            positions = [qwen21_find_substring_token_indices(pipe, analogy.prompt, e, analogy.cond.image_sizes)
+                         for e in edits]
+            built = [get_or_build_steering_vector(qwen_image21, e, args.csv_pairs, pipe, device, args.csv_cache)
                      for e in edits]
-            vecs = [v.to(device=device, dtype=embeds.dtype) for v, _ in built]
+            vecs = [v.to(device=device, dtype=analogy.prompt_embeds.dtype) for v, _ in built]
             gaps = [m["pre_normalization_norm"] for _, m in built]   # |mean(pos) - mean(neg)|: the concept's own scale
         for kept in todo:
             supp_pos = [p for p in range(n) if p not in kept]
-            if ex or csv:
-                e_k = embeds
-                if csv:                   # ablate the concept direction at each suppressed edit's tokens
-                    if args.csv_k:        # Diffusion Sliders form: x - k * gap * d, k gaps toward the "absent" pole
-                        alphas = [-args.csv_k * gaps[p] if p in supp_pos else None for p in range(n)]
-                    else:
-                        alphas = [args.csv_alpha if p in supp_pos else None for p in range(n)]
-                    e_k = apply_csv(embeds, positions, vecs, alphas,
+            steered = None
+            if csv:                       # ablate the concept direction at each suppressed edit's tokens
+                if args.csv_k:            # Diffusion Sliders form: x - k * gap * d, k gaps toward the "absent" pole
+                    alphas = [-args.csv_k * gaps[p] if p in supp_pos else None for p in range(n)]
+                else:
+                    alphas = [args.csv_alpha if p in supp_pos else None for p in range(n)]
+                steered = apply_csv(analogy.prompt_embeds, positions, vecs, alphas,
                                     scope="tokens", mode=args.csv_mode, ablate_scale=args.csv_lambda)
-                mask = (qwen21_text_token_mask(pipe, full_prompt, [edits[p] for p in supp_pos],
-                                               cond.image_sizes, embeds.shape[1], device) if ex else None)
-                img = run(cond, e_k, pad, mask)
-            else:                         # suppressed edits are left out of the prompt
-                prompt = build_analogy_prompt(edits, edits, suppress_indices=supp_pos)
-                e_k, p_k = encode_prompt(pipe, prompt, cond, device)
-                img = run(cond, e_k, p_k, None)
+            # with neither ExLoRA nor CSV the suppressed edits are left out of the prompt
+            img = generate_selective(pipe, analogy, kept, steps, args.seed, exlora=bool(ex),
+                                     prompt_embeds=steered, use_kv_cache=use_cache)
             path = pred_path(out, args.name, case["id"], kept)
             path.parent.mkdir(parents=True, exist_ok=True)
             img.save(path)
@@ -798,7 +777,7 @@ def main():
                    help="with --csv_mode add: push the suppressed tokens by -k times the edit's mean-pole gap along d")
     g.add_argument("--csv_alpha", type=float, default=0.0, help="push after ablation; 0 = pure concept removal")
     g.add_argument("--csv_pairs", type=int, default=64)
-    g.add_argument("--csv_cache", default=CSV_CACHE)
+    g.add_argument("--csv_cache", default=None, help="CSV cache directory (default ~/.cache/sia/csv/qwen_image21)")
     g.add_argument("--items_file", help="JSON list of {case, keep}: generate only these items")
     g.add_argument("--config", default="training/configs/train_exlora_qwen21.yaml")
     g.add_argument("--out", default=DEFAULT_OUT)
@@ -811,7 +790,7 @@ def main():
     c = sub.add_parser("csvbuild", parents=[data])
     c.add_argument("--config", default="training/configs/train_exlora_qwen21.yaml")
     c.add_argument("--pairs", type=int, default=64)
-    c.add_argument("--cache", default=CSV_CACHE)
+    c.add_argument("--cache", default=None, help="CSV cache directory (default ~/.cache/sia/csv/qwen_image21)")
     c.add_argument("--out", default=DEFAULT_OUT)
     c.add_argument("--limit", type=int)
     c.add_argument("--shard_index", type=int, default=0)

@@ -30,7 +30,9 @@ module level.
 """
 
 import contextlib
+import hashlib
 from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -60,7 +62,9 @@ from sia.adapters import (
     load_analora_state_dict,
     load_exlora_state_dict,
     load_tensors,
+    lora_mode_ctx,
 )
+from sia.concept_suppression import _build_generation_prompt, _parse_jsonl_records
 from sia.hf import resolve_checkpoint
 
 # ---------------------------------------------------------------------------
@@ -273,10 +277,12 @@ def flatten_rgba(img):
 # Qwen-Image-2.1 model helpers (mirror QwenImage21Pipeline.__call__)
 # ---------------------------------------------------------------------------
 
-def load_pipeline_qwen21(pretrained_model_name_or_path):
+def load_pipeline_qwen21(pretrained_model_name_or_path, revision=None, token=None):
     """Load the full pipeline in bf16. Going through ``from_pretrained`` keeps
-    the checkpoint's own config (e.g. Turbo's ``sample_sigmas``)."""
-    return QwenImage21Pipeline.from_pretrained(pretrained_model_name_or_path, dtype=torch.bfloat16)
+    the checkpoint's own config (e.g. Turbo's ``sample_sigmas``). ``revision`` and
+    ``token`` are passed to the Hub download."""
+    return QwenImage21Pipeline.from_pretrained(pretrained_model_name_or_path, dtype=torch.bfloat16,
+                                               revision=revision, token=token)
 
 
 @dataclass
@@ -538,3 +544,85 @@ def load_pipeline(args, device):
     pipe.to(device)
     transformer.eval()
     return pipe
+
+
+@torch.no_grad()
+def run_inference(pipe, cond, image_b, prompt, prompt_embeds, image_pad_mask,
+                  texts_to_suppress, num_steps,
+                  analora_scale=1.0, exlora_scale=1.0,
+                  prompt_embeds_schedule=None, generator=None, use_kv_cache=True):
+    """One B' sample. ``texts_to_suppress`` gate ExLoRA (mask built even at
+    scale 0, as in the Klein ``run_inference``); ``prompt_embeds`` may be
+    CSV-steered. The output is resized back to B's original size."""
+    token_mask = None
+    if texts_to_suppress:
+        token_mask = qwen21_text_token_mask(pipe, prompt, texts_to_suppress, cond.image_sizes,
+                                            prompt_embeds.shape[1], prompt_embeds.device)
+    with lora_mode_ctx(pipe.transformer, analora_scale, exlora_scale):
+        out = generate_qwen21(pipe, cond, prompt_embeds, image_pad_mask, num_steps,
+                              generator=generator, exlora_text_mask=token_mask,
+                              use_kv_cache=use_kv_cache,
+                              prompt_embeds_schedule=prompt_embeds_schedule)
+    return out.resize(image_b.size, Image.LANCZOS)
+
+
+# ---------------------------------------------------------------------------
+# Concept suppression vector (the encoder-specific part; see sia.concept_suppression)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_contrast_pairs(edit: str, pipe, n_pairs: int, device,
+                            max_new_tokens_per_pair: int = 90) -> Tuple[List[dict], int]:
+    """Ask the pipeline's Qwen3-VL text encoder for ``n_pairs`` contrastive
+    pos/neg sentences about ``edit`` (text only, its own chat template).
+    Sampling is not seeded. Returns ``(records, n_requested)``."""
+    tokenizer = pipe.processor.tokenizer
+    text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": _build_generation_prompt(edit, n_pairs)}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    gen_out = pipe.text_encoder.generate(
+        **inputs,
+        max_new_tokens=max(256, n_pairs * max_new_tokens_per_pair),
+        do_sample=True, temperature=1.0, top_p=0.95,
+        pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id, use_cache=True,
+    )
+    reply = tokenizer.decode(gen_out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    return _parse_jsonl_records(reply), n_pairs
+
+
+@torch.no_grad()
+def steering_pool(sentence: str, style: str, pipe, device,
+                  vl_images: Optional[list] = None) -> Optional[torch.Tensor]:
+    """Encode ``sentence`` (with ``vl_images`` as condition images, or text
+    only) and mean-pool ``prompt_embeds`` over the rows covering ``style``.
+    Case-insensitive fallback, since the pair parser checks containment with
+    ``.lower()``. Returns ``None`` if ``style`` cannot be located."""
+    sizes = [img.size for img in vl_images] if vl_images else []
+    positions = None
+    for case_sensitive in (True, False):
+        try:
+            positions = qwen21_find_substring_token_indices(
+                pipe, sentence, style, sizes, case_sensitive=case_sensitive)
+            break
+        except AssertionError:
+            continue
+    if not positions:
+        return None
+    prompt_embeds, _, _ = pipe._get_qwen_prompt_embeds([sentence], vl_images or None, device)
+    return prompt_embeds[0, positions, :].float().mean(dim=0).cpu()
+
+
+def cache_key(edit: str, prompt: Optional[str] = None, vl_images: Optional[list] = None) -> str:
+    """Cache folder name of a CSV direction: ``sha1(b"qwen-image-2.1\\0" + edit)``, in in-context
+    mode over ``prompt + "\\0" + edit`` and the condition images' size, mode and bytes (Qwen3-VL
+    text states depend on the images); first 12 hex digits. Must never change (cached pairs were
+    sampled unseeded)."""
+    h = hashlib.sha1(b"qwen-image-2.1\x00")
+    h.update(f"{prompt}\x00{edit}".encode("utf-8") if prompt else edit.encode("utf-8"))
+    for img in vl_images or []:
+        h.update(f"{img.size}{img.mode}".encode())
+        h.update(img.tobytes())
+    return h.hexdigest()[:12]

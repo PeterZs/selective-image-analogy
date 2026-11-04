@@ -34,57 +34,34 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from training.infer_single import (  # noqa: E402
-    alpha_at_step,
     annotate_image,
-    apply_csv,
     build_combined_grid,
     build_joint_grid,
     build_parser,
     build_row_grid,
-    format_schedule_tag,
     parse_args as parse_args_klein,
 )
-from training.steering_dom_qwen21 import get_or_build_steering_vector_qwen21  # noqa: E402
-from sia.adapters import lora_mode_ctx  # noqa: E402
+from sia.backbones import qwen_image21  # noqa: E402
 from sia.backbones.qwen_image21 import (  # noqa: E402
     encode_prompt,
-    generate_qwen21,
     load_pipeline,
     prepare_conditions,
     qwen21_find_substring_token_indices,
     qwen21_prompt_token_positions,
-    qwen21_text_token_mask,
+    run_inference,
+)
+from sia.concept_suppression import (  # noqa: E402
+    alpha_at_step,
+    apply_csv,
+    format_schedule_tag,
+    get_or_build_steering_vector,
 )
 from sia.prompt import build_analogy_prompt  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def run_inference(pipe, cond, image_b, prompt, prompt_embeds, image_pad_mask,
-                  texts_to_suppress, num_steps,
-                  analora_scale=1.0, exlora_scale=1.0,
-                  prompt_embeds_schedule=None, generator=None, use_kv_cache=True):
-    """One B' sample. ``texts_to_suppress`` gate ExLoRA (mask built even at
-    scale 0, as in infer_single.run_inference); ``prompt_embeds`` may be
-    CSV-steered. The output is resized back to B's original size."""
-    token_mask = None
-    if texts_to_suppress:
-        token_mask = qwen21_text_token_mask(pipe, prompt, texts_to_suppress, cond.image_sizes,
-                                            prompt_embeds.shape[1], prompt_embeds.device)
-    with lora_mode_ctx(pipe.transformer, analora_scale, exlora_scale):
-        out = generate_qwen21(pipe, cond, prompt_embeds, image_pad_mask, num_steps,
-                              generator=generator, exlora_text_mask=token_mask,
-                              use_kv_cache=use_kv_cache,
-                              prompt_embeds_schedule=prompt_embeds_schedule)
-    return out.resize(image_b.size, Image.LANCZOS)
-
-
 def parse_args():
     parser = build_parser()
-    parser.set_defaults(num_steps=40, steering_cache_dir="./steering_cache_qwen21")
+    parser.set_defaults(num_steps=40)
     parser.add_argument("--resolution", type=int, default=None,
                         help="Target-area side (default: 'resolution' from the config, else 512).")
     parser.add_argument("--no_kv_cache", action="store_true",
@@ -142,17 +119,15 @@ def main():
                  or (schedule is not None and any(abs(a) > 0 for _, a in schedule)))
     steering_vecs = [None] * len(args.edits)
     if any_alpha:
-        cache_root = Path(args.steering_cache_dir).expanduser()
-        cache_root.mkdir(parents=True, exist_ok=True)
         for i, edit_text in enumerate(args.edits):
             incontext = {}
             if args.get("incontext_steering", False):
                 incontext = dict(incontext_prompt=args.prompt, all_edits=list(args.edits),
                                  edit_index=i, build_prompt_fn=build_analogy_prompt,
                                  vl_images=cond.vl_images)
-            v, meta = get_or_build_steering_vector_qwen21(
-                edit_text, int(args.num_steering_pairs), pipe, device, cache_root,
-                regen=bool(args.regen_steering), **incontext)
+            v, meta = get_or_build_steering_vector(
+                qwen_image21, edit_text, int(args.num_steering_pairs), pipe, device,
+                cache_dir=args.steering_cache_dir, regen=bool(args.regen_steering), **incontext)
             if v.shape[-1] != base_prompt_embeds.shape[-1]:
                 raise RuntimeError(f"Steering vector dim {v.shape[-1]} != prompt_embeds dim "
                                    f"{base_prompt_embeds.shape[-1]}. Pass --regen_steering.")

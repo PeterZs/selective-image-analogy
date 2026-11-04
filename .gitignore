@@ -29,7 +29,7 @@ wandb/
 *.pt
 *.safetensors
 
-# Data (downloaded via setup.sh)
+# Local data folder (the dataset is read from the Hugging Face Hub)
 /data
 
 # Environment / secrets

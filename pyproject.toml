@@ -1,10 +1,22 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sia"
 version = "0.1.0"
+description = "SIA: Selective Image Analogy (SIGGRAPH Asia 2026)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# Dependencies are listed in requirements.txt (FLUX.2-Klein) and requirements-qwen.txt
+# (Qwen-Image-2.1) because the two backbones need different library versions.
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [tool.setuptools.packages.find]
-where = ["."]
+include = ["sia*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

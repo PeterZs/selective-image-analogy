@@ -25,7 +25,7 @@ Built on **FLUX.2-Klein**. Supports demonstrations with **2, 3 or 4 simultaneous
 | --- | --- |
 | **AnaLoRA** (learns the full analogy) | Stage 1 — `training/train_analora_flux2_klein.py` |
 | **ExLoRA** (masked edit suppression) | Stage 2 — `training/train_exlora_flux2_klein.py`, `ExLoRALinear` |
-| **Concept Suppression Vector (CSV)** | Difference-of-means direction — `training/steering_dom.py` |
+| **Concept Suppression Vector (CSV)** | Difference-of-means direction — `sia/concept_suppression.py` (+ `cache_key` / `steering_pool` in `sia/backbones/`) |
 
 ---
 
@@ -172,12 +172,12 @@ This generates a comparison strip showing: A | A' | B | analora | exlora (no sup
 
 ## Concept Suppression Vector (CSV)
 
-`steering_dom.py` computes the CSV, a difference-of-means direction in the text-embedding space:
+`sia/concept_suppression.py` computes the CSV, a difference-of-means direction in the text-embedding space:
 
 1. Uses the Qwen3 text encoder to generate N contrastive pos/neg sentence pairs per edit
 2. Encodes each via the same pipeline path as diffusion inference
 3. Computes `v = normalize(mean(pos) − mean(neg))` — a unit-norm edit direction
-4. Caches both the pairs (JSONL) and the vector (`.pt`) for reuse
+4. Caches both the pairs (JSONL) and the vector (`.pt`) for reuse, by default in `~/.cache/sia/csv/<backbone>` (`--csv_cache` / `--steering_cache_dir` to change it). A cached direction is never resampled; pair sampling is unseeded.
 
 At inference the CSV is applied to the prompt embeddings at the suppressed edit's token positions (`--csv_mode ablate` removes the component along the direction, as in the paper), complementing ExLoRA masking.
 
@@ -238,7 +238,7 @@ How the method maps onto Qwen-Image-2.1:
 
 - **Conditioning.** A, A', B are the pipeline's condition images `<image1..3>`: the Qwen3-VL encoder reads them together with the prompt, and their latents are placed in the transformer's sequence before the target, exactly as `QwenImage21Pipeline` does for multi-image editing. Images are resized with the pipeline's rule (`resolution²` area, own aspect ratio, sides multiple of 32); the configs use `resolution: 512` because the dataset images are 384×512.
 - **ExLoRA.** The transformer is single-stream, so there are no text-stream projections. ExLoRA wraps the shared attention and SwiGLU projections of every block (as AnaLoRA does) and its token mask gates it to the suppressed edit tokens of the joint text/image sequence. Because text tokens are modulated from t=0 (`causal_condition`), the ExLoRA update is step-independent and the prefix KV cache stays exact.
-- **Token mask / CSV.** Positions are rows of the Qwen3-VL output after image-slot expansion and system-prompt removal, mapped to the joint sequence for ExLoRA (`visual_analogy/utils/qwen21.py`). The CSV direction is built from that encoder path (`training/steering_dom_qwen21.py`); its cache defaults to `./steering_cache_qwen21`.
+- **Token mask / CSV.** Positions are rows of the Qwen3-VL output after image-slot expansion and system-prompt removal, mapped to the joint sequence for ExLoRA (`visual_analogy/utils/qwen21.py`). The CSV direction is built from that encoder path (`sia.backbones.qwen_image21.steering_pool`); its cache defaults to `~/.cache/sia/csv/qwen_image21`.
 - **Sampling.** As the pipeline: 40 steps, dynamic exponential shift, no CFG, prefix KV cache. A time-varying `embedding_schedule` turns the KV cache off, since the prompt embeddings then change every step.
 - **Training.** Each sample runs through the transformer on its own (gradients are averaged over `train_batch_size`), because batching prompts of different lengths would shift the target's RoPE positions relative to single-sample inference. Training sigmas get the sampler's resolution-dependent shift (`shift_train_sigmas`).
 

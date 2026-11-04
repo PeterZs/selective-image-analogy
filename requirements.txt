@@ -1,19 +1,17 @@
-accelerate==1.13.0
-datasets==4.1.1
-diffusers==0.38.0
-matplotlib==3.10.7
+# FLUX.2-Klein backbone (tested with Python 3.12 and torch 2.14).
+# The Qwen-Image-2.1 backbone needs newer libraries: use requirements-qwen.txt instead.
+torch>=2.8
+torchvision
 numpy==2.2.6
+pillow
 omegaconf==2.3.0
-peft==0.19.1
-pydantic==2.11.7
+datasets==4.1.1
+huggingface_hub
 safetensors>=0.8.0
-sentencepiece==0.2.0
-torch==2.8.0
-torchvision==0.23.0
 tqdm==4.67.1
-transformers==5.10.2
 wandb==0.27.1
-opencv-python==4.12.0.88
 lpips==0.1.4
-insightface==0.7.3
-onnxruntime==1.23.0
+accelerate==1.13.0
+diffusers==0.38.0
+peft==0.19.1
+transformers==5.10.2
