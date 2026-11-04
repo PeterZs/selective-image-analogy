@@ -44,14 +44,14 @@ def load_pipeline():
     from sia.inference import load_qwen_pipeline_with_exlora  # lazy: heavy imports
 
     return load_qwen_pipeline_with_exlora(
+        SIA_WEIGHTS, device="cuda", subfolder=SIA_SUBFOLDER, revision=SIA_REVISION,
         base=BASE_MODEL, base_revision=BASE_REVISION,
-        weights=SIA_WEIGHTS, subfolder=SIA_SUBFOLDER, revision=SIA_REVISION,
-        token=os.getenv("HF_TOKEN"), device="cuda",
+        token=os.getenv("HF_TOKEN") or None,  # public repos: no token needed
     )
 
 
 def generate(pipe, a, a_prime, b, edits, kept, seed, steps, resolution):
-    """One B' image. ``kept`` are 0-based indices into ``edits``."""
+    """One B' image at the generated size. ``kept`` are 0-based indices into ``edits``."""
     if STUB:
         return b.copy()
     from sia.inference import run_selective_analogy

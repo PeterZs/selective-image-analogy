@@ -18,6 +18,9 @@ from safetensors.torch import load_file
 
 from sia.lora import AnaLoRALinear, ExLoRALinear
 
+# PEFT adapter name of the AnaLoRA trainers (diffusers ``add_adapter`` / ``set_adapters``).
+ANALORA_ADAPTER_NAME = "visual-analogy-analora"
+
 
 @contextmanager
 def exlora_token_mask_ctx(model, mask: torch.Tensor, disable_mask_after=True):

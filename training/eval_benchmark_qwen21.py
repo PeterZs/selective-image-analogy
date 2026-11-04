@@ -96,7 +96,7 @@ CONFIGS = {
 def cmd_csvbuild(args):
     """Build (and cache) one CSV direction per distinct benchmark edit text,
     from ``--pairs`` Qwen-generated contrastive prompt pairs each (paper: 64)."""
-    import training.train_exlora_flux2_klein  # noqa: F401  (accelerate compatibility shim)
+    import sia.training  # noqa: F401  (accelerate compatibility patch)
     from diffusers import QwenImage21Pipeline
     from omegaconf import OmegaConf
     import torch
@@ -779,7 +779,7 @@ def main():
     g.add_argument("--csv_pairs", type=int, default=64)
     g.add_argument("--csv_cache", default=None, help="CSV cache directory (default ~/.cache/sia/csv/qwen_image21)")
     g.add_argument("--items_file", help="JSON list of {case, keep}: generate only these items")
-    g.add_argument("--config", default="training/configs/train_exlora_qwen21.yaml")
+    g.add_argument("--config", default="configs/exlora_qwen_image21.yaml")
     g.add_argument("--out", default=DEFAULT_OUT)
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--limit", type=int, help="first N cases only (smoke test)")
@@ -788,7 +788,7 @@ def main():
     g.add_argument("--num_shards", type=int, default=1)
 
     c = sub.add_parser("csvbuild", parents=[data])
-    c.add_argument("--config", default="training/configs/train_exlora_qwen21.yaml")
+    c.add_argument("--config", default="configs/exlora_qwen_image21.yaml")
     c.add_argument("--pairs", type=int, default=64)
     c.add_argument("--cache", default=None, help="CSV cache directory (default ~/.cache/sia/csv/qwen_image21)")
     c.add_argument("--out", default=DEFAULT_OUT)

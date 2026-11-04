@@ -16,7 +16,7 @@ Saves a strip:  A | A' | B | analora | exlora_none | exlora_e1 | ... | exlora_al
 
 Usage:
   python training/infer_single.py \\
-      --config   training/configs/train_exlora_flux2_klein.yaml \\
+      --config   configs/exlora_flux2_klein.yaml \\
       --image_a       /path/to/A.png \\
       --image_a_prime /path/to/A_prime.png \\
       --image_b       /path/to/B.png \\
@@ -48,7 +48,7 @@ from sia.backbones.flux2_klein import (
 )
 from sia.prompt import build_analogy_prompt
 # Imported for its side effect: the accelerate compatibility patch must be active before models load.
-import training.train_exlora_flux2_klein  # noqa: F401
+import sia.training  # noqa: F401
 from sia.backbones import flux2_klein
 from sia.concept_suppression import (
     STEERING_MODES,

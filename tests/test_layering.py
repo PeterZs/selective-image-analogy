@@ -6,6 +6,8 @@ backbones
     are independent of each other (the Klein env must never import Qwen code and vice versa);
 inference
     imports the shared layer only;
+training
+    imports the shared layer, inference and backbones (no ``sia.eval``);
 nothing under ``sia/``
     imports the ``training`` or ``scripts`` folders.
 
@@ -18,7 +20,7 @@ import pytest
 
 SIA = Path(__file__).resolve().parent.parent / "sia"
 
-SHARED = ["hf.py", "lora.py", "adapters.py", "prompt.py", "data.py", "concept_suppression.py", "csv.py", "viz.py"]
+SHARED = ["hf.py", "lora.py", "adapters.py", "prompt.py", "data.py", "concept_suppression.py", "viz.py"]
 BACKBONES = ["flux2_klein.py", "qwen_image21.py"]
 ROLE_SPECIFIC = ["sia.inference", "sia.training", "sia.eval"]
 OUTSIDE_PACKAGE = ["training", "scripts"]
@@ -85,6 +87,11 @@ def test_backbones_do_not_import_each_other(filename, other):
 def test_inference_imports_only_the_shared_layer():
     path = existing(SIA / "inference.py")
     assert forbidden_imports(path, ["sia.training", "sia.eval"] + OUTSIDE_PACKAGE) == []
+
+
+def test_training_imports_no_evaluation_code():
+    path = existing(SIA / "training.py")
+    assert forbidden_imports(path, ["sia.eval"] + OUTSIDE_PACKAGE) == []
 
 
 @pytest.mark.parametrize("path", sorted(SIA.rglob("*.py")), ids=lambda p: str(p.relative_to(SIA.parent)))

@@ -14,7 +14,7 @@ so it runs without the KV cache.
 
 Usage:
   python training/infer_single_qwen21.py \\
-      --config        training/configs/train_exlora_qwen21.yaml \\
+      --config        configs/exlora_qwen_image21.yaml \\
       --image_a       /path/to/A.png \\
       --image_a_prime /path/to/A_prime.png \\
       --image_b       /path/to/B.png \\

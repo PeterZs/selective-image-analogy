@@ -3,6 +3,8 @@ wandb_run_name: "analora_flux2_klein_analogy"
 
 output_dir: "experiments/analora_flux2_klein"
 
+# Model family: flux2_klein | qwen_image21 (inferred from pretrained_model_name_or_path if absent).
+backbone: flux2_klein
 pretrained_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
 
 # Training data: Hugging Face dataset id and optional revision (branch, tag or commit).

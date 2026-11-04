@@ -3,6 +3,8 @@ wandb_run_name: "analora_qwen21_analogy"
 
 output_dir: "experiments/analora_qwen21"
 
+# Model family: flux2_klein | qwen_image21 (inferred from pretrained_model_name_or_path if absent).
+backbone: qwen_image21
 pretrained_model_name_or_path: "Qwen/Qwen-Image-2.1"
 
 # Training data: Hugging Face dataset id and optional revision (branch, tag or commit).
@@ -31,7 +33,7 @@ max_train_steps: 15000
 
 lr_warmup_steps: 0
 learning_rate: 5e-5
-# Samples are run through the transformer one at a time (see train_exlora_qwen21.py)
+# Samples are run through the transformer one at a time (see sia/backbones/qwen_image21.py)
 # and averaged, so this is the effective batch per optimizer step.
 train_batch_size: 16
 gradient_accumulation_steps: 1

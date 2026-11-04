@@ -2,8 +2,9 @@
 
 Everything that depends on the model family lives here: pipeline and adapter
 loading, condition-image preparation, the joint Qwen3-VL prompt encoding and
-its token positions, the timestep shift, the transformer forward, the sampler
-and the per-sample flow-matching loss.
+its token positions, the timestep shift, the transformer forward, the sampler,
+the per-sample flow-matching loss and its training step (``train_step``), and
+the validation / benchmark strips written during training.
 
 Qwen-Image-2.1 differs from FLUX.2-Klein in two ways that matter for the
 token mask shared by ExLoRA and the CSV:
@@ -31,7 +32,9 @@ module level.
 
 import contextlib
 import hashlib
+import itertools
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -65,7 +68,10 @@ from sia.adapters import (
     lora_mode_ctx,
 )
 from sia.concept_suppression import _build_generation_prompt, _parse_jsonl_records
+from sia.data import subject_image
 from sia.hf import resolve_checkpoint
+from sia.prompt import build_analogy_prompt
+from sia.viz import render_rows
 
 # ---------------------------------------------------------------------------
 # Target modules. Every block is single-stream, so the same projections carry
@@ -489,6 +495,177 @@ def backward_per_sample(accelerator, model, losses_fn, bsz, extra_loss_fn=None):
                 loss = loss + extra_loss_fn()
             accelerator.backward(loss)
     return total
+
+
+# ---------------------------------------------------------------------------
+# Training: one optimisation step and the validation strips
+# ---------------------------------------------------------------------------
+
+def train_step(accelerator, pipe, transformer, batch, prompts, args, suppress_texts=None, extra_loss_fn=None):
+    """Per-sample flow-matching loss on a batch with its backward passes (``backward_per_sample``).
+    Returns the mean sample loss.
+
+    ``transformer`` is the model returned by ``accelerator.prepare``. ``prompts`` holds one prompt
+    per sample. ``suppress_texts`` holds, per sample, the edit texts whose tokens gate ExLoRA;
+    ``None`` runs with ExLoRA off. ``extra_loss_fn`` (e.g. the AnaLoRA anchor) joins the last
+    backward pass.
+    """
+    resolution = args.get("resolution", 512)
+
+    def losses_fn(i):
+        images = [batch['A'][i], batch['A_prime'][i], batch['B'][i]]
+        return sample_flow_loss(pipe, transformer, images, batch['B_prime'][i], prompts[i],
+                                resolution, accelerator.device, args,
+                                suppress_texts=None if suppress_texts is None else suppress_texts[i])
+
+    return backward_per_sample(accelerator, transformer, losses_fn, len(prompts), extra_loss_fn=extra_loss_fn)
+
+
+@torch.no_grad()
+def log_analora_validation(pipe, train_dataset, args, accelerator, global_step):
+    """Strip A | A' | B | B' GT | B' pred for a random matched pair."""
+    print(f"Running analogy validation at step {global_step}...")
+    device = accelerator.device
+    meta = train_dataset.sample_val_pair()
+    imgs = {k: meta[k] for k in ("a", "a_prime", "b", "b_prime")}
+
+    cond = prepare_conditions(pipe, [imgs["a"], imgs["a_prime"], imgs["b"]], args.resolution, device)
+    prompt_embeds, image_pad_mask = encode_prompt(pipe, meta["prompt"], cond, device)
+    generator = torch.Generator(device=device).manual_seed(int(args.seed))
+    pred = generate_qwen21(pipe, cond, prompt_embeds, image_pad_mask, args.num_val_inference_steps,
+                           generator=generator, use_kv_cache=args.get("use_kv_cache", True))
+
+    if accelerator.is_main_process:
+        vis_dir = Path(args.output_dir) / "validation_images"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        strip = render_rows(
+            [(meta["edit_name"], [(imgs["a"], "A"), (imgs["a_prime"], "A'"), (imgs["b"], "B"),
+                                  (imgs["b_prime"], "B' GT"), (pred, "B' pred")])],
+            title=meta["prompt"])
+        strip_path = vis_dir / f"step_{global_step:06d}.png"
+        strip.save(strip_path)
+        print(f"Saved validation strip to {strip_path}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def log_exlora_validation(pipe, train_dataset, args, accelerator, global_step):
+    """Same layout as the Klein ExLoRA validation: a header row (A, A', B,
+    B' GT all edits), then one row per kept subset of the full demo with
+    B' GT | AnaLoRA total prompt | AnaLoRA partial prompt | ExLoRA."""
+    print(f"Running ExLoRA analogy validation at step {global_step}...")
+    device = accelerator.device
+    resolution = args.get("resolution", 512)
+
+    cat, setting, item_a, item_b = train_dataset._sample_two_items()
+    common_sets = set(item_a['combined']) & set(item_b['combined'])
+    if not common_sets:
+        print(f"  No common combined sets for {cat}/{setting}; skipping validation.")
+        return
+    demo_set = max(common_sets, key=lambda s: (len(s), tuple(sorted(s))))
+    demo_indices = sorted(demo_set)
+    edits = [item_a['edits'][i] for i in demo_indices]
+    prompt = build_analogy_prompt(edits, edits)
+
+    a = subject_image(train_dataset.subjects, item_a['input'])
+    a_prime = subject_image(train_dataset.subjects, item_a['combined'][demo_set])
+    b = subject_image(train_dataset.subjects, item_b['input'])
+    b_total = subject_image(train_dataset.subjects, item_b['combined'][demo_set])
+
+    cond = prepare_conditions(pipe, [a, a_prime, b], resolution, device)
+    prompt_embeds, image_pad_mask = encode_prompt(pipe, prompt, cond, device)
+
+    def gen(embeds=prompt_embeds, pad_mask=image_pad_mask, exlora_mask=None):
+        generator = torch.Generator(device=device).manual_seed(int(args.seed))
+        return generate_qwen21(pipe, cond, embeds, pad_mask, args.num_val_inference_steps,
+                               generator=generator, exlora_text_mask=exlora_mask,
+                               use_kv_cache=args.get("use_kv_cache", True))
+
+    pred_total = gen()
+    rows = [("demo", [(a, "A"), (a_prime, "A'"), (b, "B"), (b_total, "B' GT\n(all edits)")])]
+    for r in range(len(demo_indices), -1, -1):
+        for kept in itertools.combinations(demo_indices, r):
+            kept_set = frozenset(kept)
+            supp_pos = [p for p, i in enumerate(demo_indices) if i not in kept_set]
+            supp_texts = [edits[p] for p in supp_pos]
+            gt_ref = item_b['combined'].get(kept_set)
+            gt = subject_image(train_dataset.subjects, gt_ref) if gt_ref else (b if not kept_set else None)
+            if supp_pos:
+                partial_prompt = build_analogy_prompt(edits, edits, suppress_indices=supp_pos)
+                partial_embeds, partial_pad = encode_prompt(pipe, partial_prompt, cond, device)
+                pred_partial = gen(partial_embeds, partial_pad)
+                mask = qwen21_text_token_mask(pipe, prompt, supp_texts, cond.image_sizes,
+                                              prompt_embeds.shape[1], device)
+                pred_exlora = gen(exlora_mask=mask)
+            else:
+                # Nothing suppressed: an all-zero mask leaves ExLoRA inert.
+                pred_partial = pred_exlora = pred_total
+            keep_1b = [p + 1 for p, i in enumerate(demo_indices) if i in kept_set]
+            supp_1b = [p + 1 for p in supp_pos]
+            rows.append((f"supp={supp_1b}", [
+                (gt, f"B' GT\n(keep={keep_1b})"),
+                (pred_total, "B' (AnaLoRA\ntotal prompt)"),
+                (pred_partial, "B' (AnaLoRA\npartial prompt)"),
+                (pred_exlora, "B' (ExLoRA)"),
+            ]))
+
+    if accelerator.is_main_process:
+        vis_dir = Path(args.output_dir) / "validation_images"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        strip = render_rows(rows, title=f"{cat}/{setting} — full prompt: {prompt}")
+        strip_path = vis_dir / f"step_{global_step:06d}.png"
+        strip.save(strip_path)
+        (vis_dir / f"step_{global_step:06d}_prompt.txt").write_text(
+            f"edit: {cat}/{setting}\n\nfull prompt:\n{prompt}\n")
+        print(f"Saved validation strip ({len(rows) - 1} combinations) to {strip_path}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def log_benchmark_visualization(pipe, cases, args, accelerator, global_step):
+    """Unseen-data check (no ground truth): for every benchmark case, the full
+    prompt with ExLoRA suppressing each subset of the edits in turn."""
+    print(f"Running benchmark visualization at step {global_step}...")
+    device = accelerator.device
+    resolution = args.get("resolution", 512)
+    out_dir = Path(args.output_dir) / "benchmark_images" / f"step_{global_step:06d}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for case in cases:
+        a, a_prime, b = harmonize_images_qwen21(case["a"], case["a_prime"], case["b"], case["b"])[:3]
+        edits = case["edits"]
+        prompt = build_analogy_prompt(edits, edits)
+        cond = prepare_conditions(pipe, [a, a_prime, b], resolution, device)
+        prompt_embeds, image_pad_mask = encode_prompt(pipe, prompt, cond, device)
+
+        cells = []
+        positions = range(len(edits))
+        for r in range(len(edits), -1, -1):
+            for kept in itertools.combinations(positions, r):
+                supp_texts = [edits[p] for p in positions if p not in kept]
+                mask = (qwen21_text_token_mask(pipe, prompt, supp_texts, cond.image_sizes,
+                                               prompt_embeds.shape[1], device) if supp_texts else None)
+                generator = torch.Generator(device=device).manual_seed(int(args.seed))
+                pred = generate_qwen21(pipe, cond, prompt_embeds, image_pad_mask, args.num_val_inference_steps,
+                                       generator=generator, exlora_text_mask=mask,
+                                       use_kv_cache=args.get("use_kv_cache", True))
+                cells.append((pred, f"keep={[p + 1 for p in kept]}"))
+
+        rows = [("demo", [(a, "A"), (a_prime, "A'"), (b, "B")])]
+        rows += [("ExLoRA" if i == 0 else "", cells[i:i + 4]) for i in range(0, len(cells), 4)]
+        edits_txt = " ".join(f"{n + 1}: {e}." for n, e in enumerate(edits))
+        seen = " (recipe seen in training, new subjects)" if case["recipe_in_train"] else ""
+        title = f"{case['id']}{seen} @ step {global_step} — {edits_txt}"
+        if accelerator.is_main_process:
+            render_rows(rows, title=title).save(out_dir / f"{case['id'].replace('/', '_')}.png")
+
+    print(f"Saved benchmark visualization ({len(cases)} cases) to {out_dir}")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,8 @@ output_dir: "experiments/exlora_qwen21"
 # e.g. selective-image-analogy/SIA-weights/qwen_image21/analora
 analora_path: "experiments/analora_qwen21/checkpoint-15000"
 
+# Model family: flux2_klein | qwen_image21 (inferred from pretrained_model_name_or_path if absent).
+backbone: qwen_image21
 pretrained_model_name_or_path: "Qwen/Qwen-Image-2.1"
 
 # Training data: Hugging Face dataset id and optional revision (branch, tag or commit).
