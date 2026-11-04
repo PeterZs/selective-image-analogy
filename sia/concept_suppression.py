@@ -282,6 +282,12 @@ def get_or_build_steering_vector(
         if meta_path.exists():
             meta.update(json.loads(meta_path.read_text(encoding="utf-8")))
         if meta.get("cache_version", 0) >= _CACHE_VERSION:
+            # The cache key does not include the pair count, so a direction built with another
+            # count is reused as is (use regen to rebuild it).
+            cached_pairs = meta.get("n_requested")
+            if cached_pairs is not None and cached_pairs != n_pairs:
+                print(f"[Steering DoM] Warning: cached direction for edit {edit!r} was built from "
+                      f"{cached_pairs} pairs, not the requested {n_pairs}; using the cached one.")
             return torch.load(vec_path, map_location=device).to(device=device, dtype=torch.float32), meta
         print(f"[Steering DoM] Stale cache for edit {edit!r} — regenerating …")
 
@@ -381,7 +387,7 @@ def apply_csv(
 
     mode
     ----
-      - ``"add"`` (default, original behaviour):
+      - ``"add"`` (default):
             x' = x + alpha * v̂
         Pure additive push. Requires a large ``alpha`` to overcome whatever
         component of the concept is already encoded in x.

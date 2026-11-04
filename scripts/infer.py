@@ -50,14 +50,17 @@ DEFAULT_STEPS = {"flux2_klein": 28, "qwen_image21": 40}
 
 
 def build_parser():
+    """Command-line arguments of ``scripts/infer.py``."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config",        type=str, required=True)
+    parser.add_argument("--config",        type=str, required=True,
+                        help="Model config YAML (e.g. configs/exlora_flux2_klein.yaml).")
     parser.add_argument("--backbone", type=str, default=None, choices=BACKBONES,
                         help="Model family (default: from the config).")
-    parser.add_argument("--image_a",       type=str, required=True)
-    parser.add_argument("--image_a_prime", type=str, required=True)
-    parser.add_argument("--image_b",       type=str, required=True)
+    parser.add_argument("--image_a",       type=str, required=True, help="Demonstration input image A.")
+    parser.add_argument("--image_a_prime", type=str, required=True,
+                        help="Demonstration output image A' (A with every edit applied).")
+    parser.add_argument("--image_b",       type=str, required=True, help="Query image B to edit.")
     parser.add_argument("--edits", type=str, nargs="+", required=True,
                         help="Raw edit texts in order (e.g. 'change expression to laugh'). "
                              "The prompt is auto-built from these using the same format as training.")
@@ -103,7 +106,7 @@ def build_parser():
                         help="How the steering vector modifies the prompt "
                              "embedding at target positions. "
                              "'add' (default): x' = x + alpha*v_hat — pure "
-                             "additive push (original behaviour). "
+                             "additive push. "
                              "'ablate': x' = x - (x.v_hat)*v_hat + alpha*v_hat "
                              "— directional ablation (project the concept "
                              "component OUT of x) then optional push. Usually "
@@ -111,13 +114,15 @@ def build_parser():
                              "With alpha=0, 'ablate' performs pure concept "
                              "removal. Can also be set in YAML as "
                              "'csv_mode: \"ablate\"'.")
-    parser.add_argument("--num_steering_pairs", type=int, default=32,
-                        help="Number of contrastive pos/neg sentence pairs per edit that "
-                             "the text encoder generates (Diffusion-Sliders paper uses 100 via GPT-4o; "
-                             "we default to 32 with the local Qwen to keep runtime modest).")
-    parser.add_argument("--steering_cache_dir", type=str, default=None,
-                        help="Directory in which to cache generated pairs.jsonl and "
-                             "vector.pt per edit (keyed by sha1(edit)); "
+    parser.add_argument("--num_steering_pairs", "--csv_pairs", type=int, default=32,
+                        help="Contrastive pos/neg sentence pairs per edit that the text encoder writes when "
+                             "a CSV direction is not cached (default 32; scripts/eval.py and "
+                             "scripts/build_csv.py default to 64). The cache key does not include the pair "
+                             "count: a cached direction is reused whatever count it was built with "
+                             "(a warning is printed; use --regen_steering to rebuild).")
+    parser.add_argument("--steering_cache_dir", "--csv_cache", type=str, default=None,
+                        help="CSV cache directory: one folder per edit with pairs.jsonl, vector.pt and "
+                             "meta.json, named by the backbone's cache key; "
                              "default ~/.cache/sia/csv/<backbone>.")
     parser.add_argument("--regen_steering", action="store_true",
                         help="Regenerate the contrastive pairs + DoM vector even if a cached "
@@ -129,20 +134,21 @@ def build_parser():
                              "Typical safe value: 1.0-3.0.")
     parser.add_argument("--incontext_steering", action="store_true",
                         help="Compute the DoM steering direction inside the actual inference "
-                             "prompt (in-context) instead of from isolated short sentences. "
-                             "Fixes the causal-LM context mismatch: the direction is extracted "
-                             "in the same representation space where it is applied. Requires "
+                             "prompt (in-context) instead of from isolated short sentences, so "
+                             "the direction is extracted in the same context where it is applied "
+                             "(the text encoder is causal). Requires "
                              "1+8 text-encoder forward passes per edit (fast) and no Qwen "
                              "generation.")
-    parser.add_argument("--output",         type=str, default="result.png")
+    parser.add_argument("--output",         type=str, default="result.png",
+                        help="Path of the combined grid; per-row grids and images go next to it.")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                         help="Stage-2 checkpoint to load ExLoRA/AnaLoRA from: a local dir or a Hub path "
                              "<org>/<repo>/<subfolder>[@revision]. Overrides the auto-discovery "
                              "from output_dir in the config.")
     parser.add_argument("--num_steps", type=int, default=None,
                         help="Sampling steps (default: 28 for FLUX.2-Klein, 40 for Qwen-Image-2.1).")
-    parser.add_argument("--cell_size", type=int, default=512)
-    parser.add_argument("--seed",      type=int, default=0)
+    parser.add_argument("--cell_size", type=int, default=512, help="Side of one image cell in the output grids.")
+    parser.add_argument("--seed",      type=int, default=0, help="Seed of the initial noise (same for every cell).")
     parser.add_argument("--resolution", type=int, default=None,
                         help="Qwen-Image-2.1: target-area side (default: 'resolution' from the config, else 512).")
     parser.add_argument("--no_kv_cache", action="store_true",
@@ -289,6 +295,8 @@ def setup_qwen_image21(args, device, image_a, image_a_prime, image_b, out_dir):
     token rows index ``prompt_embeds`` (the condition images' vision tokens included)."""
     qwen = load_backbone("qwen_image21")
     pipe = qwen.load_pipeline(args, device)
+    # A' snapped to A's size as in training, the demo and scripts/eval.py (no-op for equal sizes).
+    image_a, image_a_prime, image_b = qwen.harmonize_images_qwen21(image_a, image_a_prime, image_b, image_b)[:3]
     cond = qwen.prepare_conditions(pipe, [image_a, image_a_prime, image_b], args.resolution, device)
     base_prompt_embeds, image_pad_mask = qwen.encode_prompt(pipe, args.prompt, cond, device)
     print(f"[Qwen-Image-2.1] conditions {cond.image_sizes}, output {cond.target_size}, "
@@ -364,6 +372,7 @@ def steering_vectors(args, run, device, any_alpha):
 
 
 def main():
+    """Run every suppression subset (and the requested sweeps) on one demonstration and write the grids."""
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
@@ -461,9 +470,9 @@ def main():
             print(f"  Saved row grid → {row_dir / 'grid.png'}")
 
         if len(emb_scales) == 1:
-            legacy = {(rl, s): all_preds[(rl, s, emb_scales[0])] for rl, _, _ in row_descs for s in st_scales}
+            preds_by_row = {(rl, s): all_preds[(rl, s, emb_scales[0])] for rl, _, _ in row_descs for s in st_scales}
             combined = build_combined_grid(image_a, image_a_prime, image_b,
-                                           [(rl, sup) for rl, sup, _ in row_descs], legacy, st_scales,
+                                           [(rl, sup) for rl, sup, _ in row_descs], preds_by_row, st_scales,
                                            cell_size=args.cell_size, analora_image=analora_image)
         else:
             combined = build_joint_grid(image_a, image_a_prime, image_b, row_descs, all_preds,

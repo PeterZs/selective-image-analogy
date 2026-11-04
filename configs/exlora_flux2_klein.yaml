@@ -1,4 +1,4 @@
-tracker_name: visual-analogy
+tracker_name: sia
 wandb_run_name: "exlora_flux2_klein_analogy_selective"
 
 output_dir: "experiments/exlora_flux2_klein"
@@ -15,8 +15,9 @@ pretrained_model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
 dataset: "selective-image-analogy/SIA-Multi-Edit-Analogy"
 dataset_revision: null
 
-# Training (and inference) image resolution — must be a multiple of 16.
-# Inference encodes the images at sia.backbones.flux2_klein.TRAIN_SIZE, which must equal this value.
+# Square image size, used only with SIA_NATIVE_RES=0 (legacy square recipe); a multiple of 16.
+# By default every image is encoded at the dataset's native 384x512. Inference uses
+# sia.backbones.flux2_klein.TRAIN_SIZE for the square size, which must equal this value.
 resolution: 512
 
 seed: 0

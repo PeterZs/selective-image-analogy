@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark evaluation of SIA checkpoints (paper Sec. 5.2), for FLUX.2-Klein and Qwen-Image-2.1.
+"""Benchmark evaluation of SIA checkpoints, for FLUX.2-Klein and Qwen-Image-2.1.
 
 The `analogy_benchmark` test split has 239 (A, A', B) cases without ground truth. For every case
 and every non-empty proper subset of its edits (2^N - 2 per case) the method generates B' keeping
@@ -47,6 +47,8 @@ Usage:
   python scripts/eval.py score  --names s2_5000 s2_5000_csv --identity
   python scripts/eval.py report --names s2_5000 s2_5000_csv
   python scripts/eval.py compare --method s2_5000_csv --baseline s2_5000
+  # FLUX.2-Klein: score / report / compare default to the Qwen-Image-2.1 output root, so pass --out
+  python scripts/eval.py score --out experiments/eval_flux2_klein --names full --stages clip
 """
 import argparse
 import json
@@ -78,6 +80,8 @@ DEFAULT_CONFIG = "configs/exlora_qwen_image21.yaml"
 DEFAULT_OUT = {"qwen_image21": "experiments/eval_qwen21", "flux2_klein": "experiments/eval_flux2_klein"}
 DEFAULT_STEPS = {"qwen_image21": 40, "flux2_klein": 28}
 ARM_METHODS = ("full", "del", "add", "abl")
+OUT_HELP = ("output root holding <name>/ prediction folders (default experiments/eval_qwen21; "
+            "pass experiments/eval_flux2_klein for FLUX.2-Klein)")
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +214,7 @@ class KleinGenerator:
         else:
             cfg.analora_path = args.analora
             cfg.checkpoint_dir = None
-            # load_pipeline falls back to the latest checkpoint in output_dir when checkpoint_dir is
-            # unset: point it at a directory that does not exist so only the AnaLoRA is loaded.
-            cfg.output_dir = "/nonexistent/sia_eval_no_checkpoint"
+            cfg.output_dir = None   # no checkpoint lookup in output_dir: only the AnaLoRA is loaded
         self.pipe, self.tokenizer, self.text_encoder = self.klein.load_pipeline(cfg, device)
 
     def prepare(self, case, with_positions):
@@ -259,6 +261,7 @@ def save_png(img, path):
 
 
 def cmd_generate(args):
+    """Write the predicted images of every arm for the split (and full_transfer unless ``--skip_full``)."""
     cfg = OmegaConf.load(args.config)
     backbone = backbone_name(cfg)
     device = torch.device("cuda")
@@ -272,7 +275,8 @@ def cmd_generate(args):
         allowed = {(r["case"], r["keep"]) for r in json.loads(Path(args.items_file).read_text())}
         args.skip_full = True
         print(f"restricted to {len(allowed)} items from {args.items_file}", flush=True)
-    cases = load_split(args.split, args.limit, args.dataset)[args.shard_index::args.num_shards]
+    cases = load_split(args.split, args.limit, args.dataset,
+                       args.dataset_revision)[args.shard_index::args.num_shards]
 
     # ExLoRA is on with a Stage-2 checkpoint unless --ex 0 (Qwen-Image-2.1) leaves it out.
     arms = generation_arms(args, exlora=bool(args.ckpt and args.ex))
@@ -334,7 +338,8 @@ def cmd_generate(args):
     # ---- full_transfer: nothing suppressed (CSV never acts), scored against ground truth ----
     full_arms = [a for a in arms if a not in csv_arms]
     if not args.skip_full and full_arms:
-        for case in load_split("full_transfer", args.limit, args.dataset)[args.shard_index::args.num_shards]:
+        full_cases = load_split("full_transfer", args.limit, args.dataset, args.dataset_revision)
+        for case in full_cases[args.shard_index::args.num_shards]:
             for arm in full_arms:
                 path = full_path(out, arm["name"], case["id"])
                 if not path.exists():
@@ -348,7 +353,9 @@ def cmd_generate(args):
 # ---------------------------------------------------------------------------
 
 def cmd_score(args):
-    cases = load_split(args.split, args.limit, args.dataset)[args.shard_index::args.num_shards]
+    """Score the predictions of ``--names`` with CLIP and / or the VLM judge."""
+    cases = load_split(args.split, args.limit, args.dataset,
+                       args.dataset_revision)[args.shard_index::args.num_shards]
     Path(args.out).mkdir(parents=True, exist_ok=True)
     if "clip" in args.stages:
         score_clip(args, cases)
@@ -361,6 +368,7 @@ def cmd_score(args):
 # ---------------------------------------------------------------------------
 
 def build_parser():
+    """Command-line arguments of ``scripts/eval.py`` (one subparser per subcommand)."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -369,9 +377,10 @@ def build_parser():
                       help="cases to evaluate: the test benchmark, or dev_train (training subjects, "
                            "for choosing method settings without touching the test set)")
     data.add_argument("--dataset", default=DATASET, help="Hugging Face dataset id")
+    data.add_argument("--dataset_revision", default=None, help="dataset revision (branch, tag or commit)")
     shards = argparse.ArgumentParser(add_help=False)
     shards.add_argument("--shard_index", type=int, default=0, help="this worker's slice of the cases (parallel workers)")
-    shards.add_argument("--num_shards", type=int, default=1)
+    shards.add_argument("--num_shards", type=int, default=1, help="number of parallel workers")
 
     g = sub.add_parser("generate", parents=[data, shards], help="write predicted images")
     g.add_argument("--name", help="method name of a single arm set by the flags below")
@@ -383,55 +392,73 @@ def build_parser():
     g.add_argument("--ana", type=int, default=1, choices=[0, 1], help="AnaLoRA from --ckpt (Qwen-Image-2.1)")
     g.add_argument("--ex", type=int, default=1, choices=[0, 1], help="ExLoRA from --ckpt (Qwen-Image-2.1)")
     g.add_argument("--csv", type=int, default=0, choices=[0, 1], help="CSV on the suppressed edits' tokens")
-    g.add_argument("--csv_mode", default="ablate", choices=["add", "ablate"])
+    g.add_argument("--csv_mode", default="ablate", choices=["add", "ablate"],
+                   help="CSV form of --name with --csv 1: additive push (--csv_k) or ablation (--csv_lambda)")
     g.add_argument("--csv_lambda", type=float, default=1.0,
                    help="paper's lambda: x - lambda (x.v) v at suppressed tokens; 1 = orthogonal projection")
     g.add_argument("--csv_k", type=float, default=0.0,
                    help="push the suppressed tokens by -k times the edit's mean-pole gap along d")
     g.add_argument("--csv_alpha", type=float, default=0.0, help="push after ablation; 0 = pure concept removal")
-    g.add_argument("--csv_pairs", type=int, default=64, help="contrast pairs per edit when a direction is built")
-    g.add_argument("--csv_cache", default=None, help="CSV cache directory (default ~/.cache/sia/csv/<backbone>)")
+    g.add_argument("--csv_pairs", "--num_steering_pairs", type=int, default=64,
+                   help="contrast pairs per edit when a direction is built (default 64; scripts/infer.py "
+                        "defaults to 32). The cache key does not include the pair count: a cached direction "
+                        "is reused whatever count it was built with (a warning is printed)")
+    g.add_argument("--csv_cache", "--steering_cache_dir", default=None,
+                   help="CSV cache directory (default ~/.cache/sia/csv/<backbone>)")
     g.add_argument("--csv_pairs_from", default=None,
                    help="CSV cache of another backbone whose pairs.jsonl (matched by edit text) are re-encoded "
                         "with this backbone's encoder instead of sampling new pairs")
     g.add_argument("--items_file", help="JSON list of {case, keep}: generate only these items")
     g.add_argument("--config", default=DEFAULT_CONFIG, help="model config (backbone, base model, lora_rank)")
     g.add_argument("--out", default=None, help="output root (default experiments/eval_<backbone>)")
-    g.add_argument("--seed", type=int, default=0)
+    g.add_argument("--seed", type=int, default=0, help="seed of the initial noise (same for every image)")
     g.add_argument("--num_steps", type=int, default=None,
                    help="sampling steps (default: num_val_inference_steps of the config; 40 Qwen, 28 Klein)")
     g.add_argument("--limit", type=int, help="first N cases only (smoke test)")
     g.add_argument("--skip_full", action="store_true", help="skip the full_transfer split")
 
     s = sub.add_parser("score", parents=[data, shards], help="CLIP and VLM-judge scores")
-    s.add_argument("--names", nargs="*", default=[])
+    s.add_argument("--names", nargs="*", default=[], help="method names (folders under --out) to score")
     s.add_argument("--identity", action="store_true", help="also score the no-edit control (output = B)")
-    s.add_argument("--stages", nargs="+", default=["clip", "judge"], choices=["clip", "judge"])
-    s.add_argument("--out", default=DEFAULT_OUT["qwen_image21"])
-    s.add_argument("--limit", type=int)
-    s.add_argument("--limit_items", type=int)
-    s.add_argument("--judge_batch", type=int, default=8)
+    s.add_argument("--stages", nargs="+", default=["clip", "judge"], choices=["clip", "judge"],
+                   help="clip: CLIP directional + full-transfer metrics; judge: VLM judge (about 70 GB of GPU memory)")
+    s.add_argument("--out", default=DEFAULT_OUT["qwen_image21"], help=OUT_HELP)
+    s.add_argument("--limit", type=int, help="first N cases only")
+    s.add_argument("--limit_items", type=int, help="judge at most N items in this run")
+    s.add_argument("--judge_batch", type=int, default=8, help="items per judge forward pass")
 
     r = sub.add_parser("report", parents=[data, shards], help="markdown report of scored runs")
-    r.add_argument("--names", nargs="+", required=True)
-    r.add_argument("--identity", action="store_true")
-    r.add_argument("--out", default=DEFAULT_OUT["qwen_image21"])
-    r.add_argument("--report_name", default="report.md")
+    r.add_argument("--names", nargs="+", required=True, help="scored method names to report")
+    r.add_argument("--identity", action="store_true", help="also report the no-edit control (output = B)")
+    r.add_argument("--out", default=DEFAULT_OUT["qwen_image21"], help=OUT_HELP)
+    r.add_argument("--report_name", default="report.md", help="report file name under --out")
     r.add_argument("--items_file", help="JSON list of {case, keep}: report only these items")
     r.add_argument("--note", default="", help="text added under the report title")
 
     c = sub.add_parser("compare", parents=[data], help="per-sample paired comparison of two scored runs")
     c.add_argument("--method", required=True, help="run to evaluate (e.g. a CSV run)")
     c.add_argument("--baseline", required=True, help="run it is compared with (same items, same seed)")
-    c.add_argument("--out", default=DEFAULT_OUT["qwen_image21"])
+    c.add_argument("--out", default=DEFAULT_OUT["qwen_image21"], help=OUT_HELP)
     c.add_argument("--items_out", default="better_items.json",
                    help="file (under --out) listing the samples where --method scored higher")
-    c.add_argument("--report_name", default="compare.md")
+    c.add_argument("--report_name", default="compare.md", help="report file name under --out")
     return ap
 
 
+def check_predictions(out, names):
+    """Exit with a clear error when none of ``names`` has a prediction folder ``<out>/<name>/``."""
+    if names and not any((Path(out) / name).is_dir() for name in names):
+        raise SystemExit(f"no predictions for {', '.join(names)} under {out}/ (expected {out}/<name>/); "
+                         f"for FLUX.2-Klein pass --out experiments/eval_flux2_klein, or --out <generate's --out>")
+
+
 def main():
+    """Parse the command line and run the chosen subcommand."""
     args = build_parser().parse_args()
+    if args.cmd in ("score", "report"):
+        check_predictions(args.out, args.names)
+    elif args.cmd == "compare":
+        check_predictions(args.out, [args.method, args.baseline])
     {"generate": cmd_generate, "score": cmd_score, "report": write_report, "compare": compare_runs}[args.cmd](args)
 
 

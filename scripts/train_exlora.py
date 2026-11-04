@@ -153,6 +153,7 @@ def build_optimizer(transformer, args):
 
 
 def build_data(args, accelerator, optimizer, harmonize_fn=None):
+    """ExLoRA training dataset, its shuffled DataLoader and the constant learning-rate scheduler."""
     train_dataset = SelectiveAnalogyDataset(args.get("dataset", DATASET), args.get("dataset_revision"),
                                             harmonize_fn=harmonize_fn)
     train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size,
@@ -166,6 +167,7 @@ def build_data(args, accelerator, optimizer, harmonize_fn=None):
 
 
 def setup_flux2_klein(args, accelerator):
+    """Load FLUX.2-Klein with AnaLoRA + ExLoRA for Stage 2 training; returns a ``TrainingRun``."""
     from diffusers import Flux2KleinPipeline
     from diffusers.models import Flux2Transformer2DModel
 
@@ -228,6 +230,7 @@ def setup_flux2_klein(args, accelerator):
 
 
 def setup_qwen_image21(args, accelerator):
+    """Load Qwen-Image-2.1 with AnaLoRA + ExLoRA for Stage 2 training; returns a ``TrainingRun``."""
     from diffusers import QwenImage21Transformer2DModel
 
     from sia.backbones import qwen_image21 as bb
@@ -303,6 +306,7 @@ SETUP = {"flux2_klein": setup_flux2_klein, "qwen_image21": setup_qwen_image21}
 # ---------------------------------------------------------------------------
 
 def main():
+    """Train ExLoRA (Stage 2) with the configuration given on the command line."""
     args = parse_args(print_args=True)
     backbone = backbone_name(args)
     accelerator = start_run(args)

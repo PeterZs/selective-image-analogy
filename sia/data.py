@@ -684,6 +684,6 @@ def covered_by_training(kept, n_edits, subject_type):
     return n_edits == 2 and subject_type == "creature"
 
 
-def distinct_edits(split="analogy_benchmark", dataset=DATASET):
+def distinct_edits(split="analogy_benchmark", dataset=DATASET, revision=None):
     """Return the sorted distinct edit texts of an evaluation split."""
-    return sorted({e for c in load_split(split, dataset=dataset) for e in c["edits"]})
+    return sorted({e for c in load_split(split, dataset=dataset, revision=revision) for e in c["edits"]})

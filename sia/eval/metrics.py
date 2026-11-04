@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 
 from sia.data import load_split
-from sia.eval.results import _items, _jsonl_read, _load_pred, full_path, keep_tag
+from sia.eval.results import full_path, iter_items, jsonl_read, keep_tag, load_pred
 
 CLIP_REPO = "openai/clip-vit-large-patch14"
 
@@ -50,11 +50,11 @@ def score_clip(args, cases):
     cos = torch.nn.functional.cosine_similarity
     base_txt = txt_emb(["a photo"])[0]
     path = Path(args.out) / "clip.jsonl"
-    done = {(r["method"], r["case"], r["keep"]) for r in _jsonl_read(path)}
+    done = {(r["method"], r["case"], r["keep"]) for r in jsonl_read(path)}
     by_case = {c["id"]: c for c in cases}
     emb_cache = {}
     rows = []
-    items = [it for it in _items(args.out, args.names, cases, args.identity)
+    items = [it for it in iter_items(args.out, args.names, cases, args.identity)
              if (it[0], it[1]["id"], keep_tag(it[2])) not in done]
     # group by case so A, A', B embeddings are computed once
     for cid in sorted({it[1]["id"] for it in items}):
@@ -63,7 +63,7 @@ def score_clip(args, cases):
             emb_cache[cid] = img_emb([case["a"], case["a_prime"], case["b"]])
         ea, eap, eb = emb_cache[cid]
         group = [it for it in items if it[1]["id"] == cid]
-        e_out = img_emb([_load_pred(it[3], case) for it in group])
+        e_out = img_emb([load_pred(it[3], case) for it in group])
         for it, eo in zip(group, e_out):
             kept = it[2]
             retained = " ".join(case["edits"][p] for p in kept)
@@ -89,7 +89,8 @@ def score_full_transfer(args):
     from transformers import AutoImageProcessor, AutoModel, CLIPModel, CLIPProcessor
 
     device = "cuda"
-    cases = load_split("full_transfer", args.limit, args.dataset)[args.shard_index::args.num_shards]
+    cases = load_split("full_transfer", args.limit, args.dataset,
+                       args.dataset_revision)[args.shard_index::args.num_shards]
     lp = lpips.LPIPS(net="vgg", verbose=False).to(device).eval()
     dino = AutoModel.from_pretrained(DINO_REPO).to(device).eval()
     dproc = AutoImageProcessor.from_pretrained(DINO_REPO)
@@ -117,6 +118,6 @@ def score_full_transfer(args):
             rows.append({"method": name, "case": case["id"], "lpips": l, "dino_dist": dd, "clip_i": ci})
     path = Path(args.out) / "full_transfer.jsonl"
     seen = {(r["method"], r["case"]) for r in rows}
-    keep = [r for r in _jsonl_read(path) if (r["method"], r["case"]) not in seen]   # keep other shards' rows
+    keep = [r for r in jsonl_read(path) if (r["method"], r["case"]) not in seen]   # keep other shards' rows
     path.write_text("".join(json.dumps(r) + "\n" for r in keep + rows))
     print(f"[full_transfer] {len(rows)} items", flush=True)

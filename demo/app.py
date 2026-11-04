@@ -78,6 +78,7 @@ def _gpu(fn):
 
 @_gpu
 def run_on_gpu(a, a_prime, b, edits, kept, seed, steps, resolution):
+    """Generate B' on the GPU and return it at B's size."""
     out = generate(PIPE, a, a_prime, b, edits, kept, seed, steps, resolution)
     return out if out.size == b.size else out.resize(b.size)
 
@@ -89,10 +90,12 @@ def run_on_gpu(a, a_prime, b, edits, kept, seed, steps, resolution):
 MAX_EDITS = 4
 MIN_EDITS = 2
 MAX_EDIT_CHARS = 200
+MAX_IMAGE_SIDE = 4096
+MAX_IMAGE_PIXELS = 20_000_000
 
 
 class InputError(ValueError):
-    pass
+    """Invalid user input; shown to the user as a Gradio error."""
 
 
 def clean_edits(raw):
@@ -105,6 +108,11 @@ def validate(a, a_prime, b, raw_edits, kept_labels):
     missing = [name for name, img in (("A", a), ("A'", a_prime), ("B", b)) if img is None]
     if missing:
         raise InputError(f"Please provide image(s): {', '.join(missing)}.")
+    for name, img in (("A", a), ("A'", a_prime), ("B", b)):
+        w, h = img.size
+        if max(w, h) > MAX_IMAGE_SIDE or w * h > MAX_IMAGE_PIXELS:
+            raise InputError(f"Image {name} is too large ({w}x{h}); the limit is {MAX_IMAGE_SIDE} px per side "
+                             f"and {MAX_IMAGE_PIXELS // 1_000_000} megapixels.")
 
     boxes = clean_edits(raw_edits)
     n = sum(1 for t in boxes if t)
@@ -139,16 +147,18 @@ def validate(a, a_prime, b, raw_edits, kept_labels):
 
 
 def run(a, a_prime, b, e1, e2, e3, e4, kept_labels, seed, steps, resolution):
+    """Validate the inputs, generate B' and describe what was kept and suppressed."""
     try:
         edits, kept, note = validate(a, a_prime, b, [e1, e2, e3, e4], kept_labels)
     except InputError as exc:
-        raise gr.Error(str(exc), print_exception=False)
+        raise gr.Error(str(exc), print_exception=False) from None
     out = run_on_gpu(a, a_prime, b, edits, kept, int(seed), int(steps), int(resolution))
     kept_txt = "; ".join(f"Edit {i + 1} ({edits[i]})" for i in kept)
     return out, f"Kept: {kept_txt}.\n\n{note}"
 
 
 def kept_choices(*raw):
+    """Labels of the keep checkboxes from the current edit boxes."""
     labels = [(f"Edit {i + 1}: {t}" if t else f"Edit {i + 1} (empty)", str(i + 1))
               for i, t in enumerate(clean_edits(raw))]
     return gr.update(choices=labels)
@@ -163,6 +173,7 @@ EXAMPLES_META = json.loads((EXAMPLES_DIR / "examples.json").read_text())
 
 
 def example_rows():
+    """Inputs and labels of the bundled examples for ``gr.Examples``."""
     rows, labels = [], []
     for ex in EXAMPLES_META["examples"]:
         d = EXAMPLES_DIR / ex["folder"]
@@ -212,6 +223,7 @@ Edited images were generated with [FLUX.2 [klein]](https://huggingface.co/black-
 
 
 def build_demo():
+    """Build the Gradio interface."""
     with gr.Blocks(title="SIA: Selective Image Analogy", delete_cache=(3600, 3600)) as demo:
         gr.Markdown(HEADER)
         if STUB:
@@ -235,8 +247,8 @@ def build_demo():
                 with gr.Accordion("Advanced", open=False):
                     seed = gr.Number(label="Seed", value=0, precision=0, minimum=0, maximum=2**31 - 1)
                     steps = gr.Slider(label="Steps", minimum=20, maximum=50, step=1, value=DEFAULT_STEPS)
-                    resolution = gr.Radio(label="Resolution (target area side; 640 is untested)",
-                                          choices=[512, 640], value=DEFAULT_RESOLUTION)
+                    resolution = gr.Radio(label="Resolution (target area side)",
+                                          choices=[DEFAULT_RESOLUTION], value=DEFAULT_RESOLUTION)
                 btn = gr.Button("Run", variant="primary")
                 info = gr.Markdown()
 

@@ -1,4 +1,4 @@
-"""VLM judge of selective analogy outputs (paper Sec. 5.2).
+"""VLM judge of selective analogy outputs.
 
 The judge sees (A, A', B, output) with the retained and suppressed edit lists and returns Retained
 Accuracy, Preservation and Suppression (0-10) plus per-edit detections, from which Edit Recall and
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sia.eval.results import _items, _jsonl_read, _load_pred, keep_tag
+from sia.eval.results import iter_items, jsonl_read, keep_tag, load_pred
 
 JUDGE_REPO = "Qwen/Qwen3-VL-32B-Instruct"
 
@@ -96,8 +96,8 @@ def score_judge(args, cases):
     print(f"[judge] loaded {JUDGE_REPO}", flush=True)
 
     out_path = Path(args.out) / "judge.jsonl"
-    done = {(r["method"], r["case"], r["keep"]) for r in _jsonl_read(out_path)}
-    todo = [it for it in _items(args.out, args.names, cases, args.identity)
+    done = {(r["method"], r["case"], r["keep"]) for r in jsonl_read(out_path)}
+    todo = [it for it in iter_items(args.out, args.names, cases, args.identity)
             if (it[0], it[1]["id"], keep_tag(it[2])) not in done]
     if args.limit_items:
         todo = todo[:args.limit_items]
@@ -107,7 +107,7 @@ def score_judge(args, cases):
         method, case, kept, p = it
         content = []
         for label, im in (("Image 1 (A):", case["a"]), ("Image 2 (A'):", case["a_prime"]),
-                          ("Image 3 (B):", case["b"]), ("Image 4 (OUTPUT):", _load_pred(p, case))):
+                          ("Image 3 (B):", case["b"]), ("Image 4 (OUTPUT):", load_pred(p, case))):
             content += [{"type": "text", "text": label}, {"type": "image", "image": im}]
         content.append({"type": "text", "text": build_judge_prompt(case["edits"], kept)})
         return [{"role": "user", "content": content}]

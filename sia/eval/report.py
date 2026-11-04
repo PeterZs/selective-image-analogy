@@ -9,7 +9,7 @@ import numpy as np
 
 from sia.data import covered_by_training, load_split
 from sia.eval.judge import JUDGE_REPO
-from sia.eval.results import _jsonl_read
+from sia.eval.results import jsonl_read
 
 # Component grid of the ablation: AnaLoRA (visual analogy), ExLoRA (token-gated suppression) and CSV
 # (concept suppression vector on the edit-token embeddings). Every row uses the weights of one Stage 2
@@ -31,15 +31,16 @@ def write_report(args):
     CIs over cases, strata (training coverage, seen/unseen recipes, number of edits), the ablation
     of the ``CONFIGS`` runs present, full-transfer metrics and paired differences to the best method.
 
-    ``args``: ``out``, ``names``, ``identity``, ``split``, ``dataset``, ``shard_index``, ``num_shards``,
-    ``items_file`` (restrict to these items), ``note`` and ``report_name``.
+    ``args``: ``out``, ``names``, ``identity``, ``split``, ``dataset``, ``dataset_revision``, ``shard_index``,
+    ``num_shards``, ``items_file`` (restrict to these items), ``note`` and ``report_name``.
     """
-    all_cases = load_split(args.split, dataset=args.dataset)
+    all_cases = load_split(args.split, dataset=args.dataset, revision=args.dataset_revision)
     cases = {c["id"]: c for c in all_cases}
     selected = {c["id"] for c in all_cases[args.shard_index::args.num_shards]}
-    ft_selected = {c["id"] for c in load_split("full_transfer", dataset=args.dataset)[args.shard_index::args.num_shards]}
-    judge = {(r["method"], r["case"], r["keep"]): r for r in _jsonl_read(Path(args.out) / "judge.jsonl")}
-    clip = {(r["method"], r["case"], r["keep"]): r for r in _jsonl_read(Path(args.out) / "clip.jsonl")}
+    ft_cases = load_split("full_transfer", dataset=args.dataset, revision=args.dataset_revision)
+    ft_selected = {c["id"] for c in ft_cases[args.shard_index::args.num_shards]}
+    judge = {(r["method"], r["case"], r["keep"]): r for r in jsonl_read(Path(args.out) / "judge.jsonl")}
+    clip = {(r["method"], r["case"], r["keep"]): r for r in jsonl_read(Path(args.out) / "clip.jsonl")}
     names = list(args.names) + (["identity"] if args.identity else [])
 
     only = None
@@ -156,7 +157,7 @@ def write_report(args):
         table(f"{n_e}-edit demonstrations", lambda r, n_e=n_e: r["n_edits"] == n_e)
 
     # full-transfer ground-truth metrics
-    ft = [r for r in _jsonl_read(Path(args.out) / "full_transfer.jsonl") if r["case"] in ft_selected]
+    ft = [r for r in jsonl_read(Path(args.out) / "full_transfer.jsonl") if r["case"] in ft_selected]
     if ft:
         lines += ["## Full transfer vs ground truth (75 cases, nothing suppressed)", "",
                   "| method | n | LPIPS ↓ | DINOv2 dist ↓ | CLIP-I ↑ |", "|---|---|---|---|---|"]
@@ -209,9 +210,9 @@ def compare_runs(args):
     ``<out>/<report_name>`` (better / same / worse counts per score and stratum, sign test on Avg)
     and ``<out>/<items_out>`` (the samples where ``method`` scored higher, usable as ``--items_file``).
     """
-    cases = {c["id"]: c for c in load_split(args.split, dataset=args.dataset)}
+    cases = {c["id"]: c for c in load_split(args.split, dataset=args.dataset, revision=args.dataset_revision)}
     judge = {}
-    for r in _jsonl_read(Path(args.out) / "judge.jsonl"):
+    for r in jsonl_read(Path(args.out) / "judge.jsonl"):
         if r["method"] in (args.method, args.baseline) and r["ret_acc"] is not None:
             judge.setdefault((r["case"], r["keep"]), {})[r["method"]] = r
     items = []

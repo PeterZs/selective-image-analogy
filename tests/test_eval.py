@@ -3,6 +3,7 @@
 Expected values were computed with the original functions (``training/eval_benchmark_qwen21.py``)
 before they moved: the on-disk layout must not change, or existing evaluation runs stop resuming.
 """
+import argparse
 import importlib.util
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from PIL import Image
 
 from sia.data import subsets_for
 from sia.eval.judge import build_judge_prompt, parse_judge
-from sia.eval.results import _items, _load_pred, full_path, keep_tag, pred_path, safe_id
+from sia.eval.results import full_path, iter_items, keep_tag, load_pred, pred_path, safe_id
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 
@@ -35,9 +36,9 @@ def test_items_enumerates_existing_predictions_and_identity(tmp_path):
     p = pred_path(tmp_path, "m", case["id"], (1,))
     p.parent.mkdir(parents=True)
     Image.new("RGB", (4, 4)).save(p)
-    items = list(_items(tmp_path, ["m"], [case], include_identity=True))
+    items = list(iter_items(tmp_path, ["m"], [case], include_identity=True))
     assert [(m, k, q) for m, _, k, q in items] == [("m", (1,), p), ("identity", (0,), None), ("identity", (1,), None)]
-    assert _load_pred(None, case).getpixel((0, 0)) == (1, 2, 3)
+    assert load_pred(None, case).getpixel((0, 0)) == (1, 2, 3)
 
 
 def test_parse_judge():
@@ -69,7 +70,7 @@ def test_parse_arm(eval_script):
     assert eval_script.parse_arm("y:abl:2") == {"name": "y", "method": "abl", "csv_k": None, "csv_alpha": 0.0,
                                                 "csv_lambda": 2.0}
     for bad in ("full", "x:foo", "x:add"):
-        with pytest.raises(Exception):
+        with pytest.raises(argparse.ArgumentTypeError):
             eval_script.parse_arm(bad)
 
 

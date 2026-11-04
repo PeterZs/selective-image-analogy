@@ -34,13 +34,22 @@ def klein():
     return pytest.importorskip("sia.backbones.flux2_klein", exc_type=ImportError)
 
 
+def skip_unless_real_tokenizer(tokenizer, what):
+    """Skip when ``tokenizer`` is a placeholder: offline with an empty cache, transformers can return a tokenizer
+    without vocabulary or chat template instead of raising."""
+    if tokenizer.chat_template is None or len(tokenizer) < 1000:
+        pytest.skip(f"{what} not in the Hugging Face cache")
+
+
 @pytest.fixture(scope="module")
 def klein_tokenizer():
     from transformers import Qwen2TokenizerFast
     try:
-        return Qwen2TokenizerFast.from_pretrained("black-forest-labs/FLUX.2-klein-base-9B", subfolder="tokenizer")
-    except OSError as exc:
+        tokenizer = Qwen2TokenizerFast.from_pretrained("black-forest-labs/FLUX.2-klein-base-9B", subfolder="tokenizer")
+    except (OSError, ValueError) as exc:
         pytest.skip(f"FLUX.2-Klein tokenizer not available: {exc}")
+    skip_unless_real_tokenizer(tokenizer, "FLUX.2-Klein tokenizer")
+    return tokenizer
 
 
 def klein_ids(klein, prompt, tokenizer):
@@ -114,8 +123,9 @@ def qwen_pipe(qwen):
     try:
         snapshot = snapshot_download("Qwen/Qwen-Image-2.1", allow_patterns="processor/*")
         processor = Qwen3VLProcessor.from_pretrained(f"{snapshot}/processor")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         pytest.skip(f"Qwen-Image-2.1 processor not available: {exc}")
+    skip_unless_real_tokenizer(processor.tokenizer, "Qwen-Image-2.1 processor")
     # A processor-only pipeline is enough for the prompt templates and ``_drop_idx``.
     return QwenImage21Pipeline(scheduler=None, vae=None, text_encoder=None, processor=processor, transformer=None)
 

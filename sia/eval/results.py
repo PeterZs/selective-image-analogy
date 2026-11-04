@@ -32,7 +32,7 @@ def full_path(out, name, case_id):
     return Path(out) / name / "full_transfer" / f"{safe_id(case_id)}.png"
 
 
-def _jsonl_read(path):
+def jsonl_read(path):
     """Rows of a JSON-lines file; ``[]`` if it does not exist yet."""
     path = Path(path)
     if not path.exists():
@@ -40,7 +40,7 @@ def _jsonl_read(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def _items(out, names, cases, include_identity):
+def iter_items(out, names, cases, include_identity):
     """(method, case, kept, image path) for every generated item of ``names`` in ``out``, plus
     (``"identity"``, case, kept, ``None``) for every item when ``include_identity`` is set."""
     for name in names:
@@ -55,6 +55,6 @@ def _items(out, names, cases, include_identity):
                 yield "identity", case, kept, None   # output = B, the no-edit control
 
 
-def _load_pred(item, case):
+def load_pred(item, case):
     """The output image of an item: the file ``item``, or B itself for the identity control (``None``)."""
     return case["b"].copy() if item is None else Image.open(item).convert("RGB")

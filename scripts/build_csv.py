@@ -49,30 +49,37 @@ def load_text_encoder(cfg, backbone, device):
 
 
 def build_parser():
+    """Command-line arguments of ``scripts/build_csv.py``."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="configs/exlora_qwen_image21.yaml",
                     help="model config (backbone and base model)")
     ap.add_argument("--split", default="analogy_benchmark", choices=SPLITS, help="split whose edits are built")
     ap.add_argument("--dataset", default=DATASET, help="Hugging Face dataset id")
-    ap.add_argument("--pairs", type=int, default=64, help="contrastive pairs per edit")
-    ap.add_argument("--csv_cache", default=None, help="CSV cache directory (default ~/.cache/sia/csv/<backbone>)")
+    ap.add_argument("--dataset_revision", default=None, help="dataset revision (branch, tag or commit)")
+    ap.add_argument("--pairs", "--csv_pairs", "--num_steering_pairs", type=int, default=64,
+                    help="contrastive pairs per edit (default 64; scripts/infer.py defaults to 32). The cache "
+                         "key does not include the pair count: an edit already cached is not rebuilt, whatever "
+                         "count it was built with (a warning is printed)")
+    ap.add_argument("--csv_cache", "--steering_cache_dir", default=None,
+                    help="CSV cache directory (default ~/.cache/sia/csv/<backbone>)")
     ap.add_argument("--out", default=None,
                     help="where csv_build_<shard>.json goes (default experiments/eval_<backbone>)")
     ap.add_argument("--limit", type=int, help="first N edits only")
     ap.add_argument("--shard_index", type=int, default=0, help="this worker's slice of the edits (parallel workers)")
-    ap.add_argument("--num_shards", type=int, default=1)
+    ap.add_argument("--num_shards", type=int, default=1, help="number of parallel workers")
     return ap
 
 
 def main():
+    """Build (or read from the cache) the CSV direction of every distinct edit of the split."""
     args = build_parser().parse_args()
     cfg = OmegaConf.load(args.config)
     backbone = backbone_name(cfg)
     module = load_backbone(backbone)
     device = torch.device("cuda")
     pipe = load_text_encoder(cfg, backbone, device)
-    edits = distinct_edits(args.split, args.dataset)
+    edits = distinct_edits(args.split, args.dataset, args.dataset_revision)
     edits = edits[:args.limit] if args.limit else edits
     edits = edits[args.shard_index::args.num_shards]
     t0 = time.time()

@@ -1,4 +1,4 @@
-tracker_name: visual-analogy
+tracker_name: sia
 wandb_run_name: "exlora_qwen21_analogy_selective"
 
 output_dir: "experiments/exlora_qwen21"

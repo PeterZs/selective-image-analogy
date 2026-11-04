@@ -1,7 +1,7 @@
 # Qwen-Image-2.1 backbone (tested with Python 3.12 and torch 2.14). Use this file instead of
 # requirements.txt: QwenImage21Pipeline needs a newer diffusers, and the Qwen-Image-2.1 model
 # card asks for transformers>=5.17.
-torch>=2.8
+torch>=2.8,<2.15
 torchvision
 numpy==2.2.6
 pillow

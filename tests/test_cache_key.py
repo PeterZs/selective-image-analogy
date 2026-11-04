@@ -7,17 +7,18 @@ silently resample them and change every CSV result. Each backbone has its own sc
 - Qwen-Image-2.1: the same, prefixed with ``b"qwen-image-2.1\\0"`` and followed by the condition images'
   size, mode and bytes (in-context mode).
 
-The fixed pairs below were computed with the original functions. If the frozen Qwen cache
-(``steering_cache_qwen21``, 127 folders) is present, every folder name is recomputed from its
-``meta.json`` as well.
+The fixed pairs below were computed with the original functions. If ``SIA_REFERENCE_DIR`` points to a
+directory holding the original Qwen cache (``steering_cache_qwen21``, 127 folders), every folder name is
+recomputed from its ``meta.json`` as well.
 """
 import json
+import os
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
-QWEN_CACHE = Path("/workspace/selective-image-analogy/steering_cache_qwen21")
+REFERENCE_DIR = os.environ.get("SIA_REFERENCE_DIR")
 
 
 def backbone(name):
@@ -59,8 +60,9 @@ def test_qwen_cache_key(edit, prompt, n_images, key):
 
 
 def test_qwen_cache_folders_hash_to_their_names():
-    if not QWEN_CACHE.is_dir():
-        pytest.skip(f"{QWEN_CACHE} not present")
+    if not REFERENCE_DIR or not (Path(REFERENCE_DIR) / "steering_cache_qwen21").is_dir():
+        pytest.skip("set SIA_REFERENCE_DIR to a directory containing steering_cache_qwen21/")
+    QWEN_CACHE = Path(REFERENCE_DIR) / "steering_cache_qwen21"
     cache_key = backbone("qwen_image21").cache_key
     folders = sorted(p for p in QWEN_CACHE.iterdir() if p.is_dir())
     assert len(folders) == 127

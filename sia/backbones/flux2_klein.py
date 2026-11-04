@@ -236,6 +236,7 @@ def build_token_mask(full_prompt, edit_texts, tokenizer, device, max_seq_len=512
 # ---------------------------------------------------------------------------
 
 def load_models(args):
+    """Load the frozen FLUX.2-Klein tokenizer, text encoder, VAE, transformer (models in bf16) and scheduler."""
     path = args.pretrained_model_name_or_path
     # The frozen models are cast to bf16 in main() anyway; loading them in bf16
     # avoids a ~70 GB fp32 copy in host RAM (the LoRA layers stay fp32).
@@ -254,8 +255,9 @@ def load_pipeline(args, device):
     """Klein pipeline with AnaLoRA + ExLoRA loaded.
 
     Weights come from ``args.checkpoint_dir`` (local dir or Hub path, see ``sia.hf.resolve_checkpoint``)
-    or else the latest checkpoint in ``args.output_dir``. A Stage-2 checkpoint carries its own AnaLoRA;
-    only without one is the Stage-1 AnaLoRA read from ``args.analora_path``.
+    or else the latest checkpoint in ``args.output_dir`` (no lookup when ``output_dir`` is ``None``). A
+    Stage-2 checkpoint carries its own AnaLoRA; only without one is the Stage-1 AnaLoRA read from
+    ``args.analora_path``.
     """
     tokenizer, text_encoder, vae, transformer, scheduler = load_models(args)
 
@@ -263,8 +265,10 @@ def load_pipeline(args, device):
     if explicit_ckpt:
         # Fail loud: a wrong path must not silently leave ExLoRA zero-initialised.
         ckpt_dir = resolve_checkpoint(explicit_ckpt)
-    else:
+    elif getattr(args, "output_dir", None):
         ckpt_dir = find_latest_checkpoint(args.output_dir)
+    else:
+        ckpt_dir = None
 
     # Take the rank from the weights so a config/checkpoint rank mismatch can't break loading.
     analora_file, exlora_file = checkpoint_files(ckpt_dir) if ckpt_dir else (None, None)
@@ -296,6 +300,9 @@ def load_pipeline(args, device):
                 f"  Files present: {sorted(os.listdir(ckpt_dir))}\n"
                 f"  Without this file ExLoRA is zero-initialised and has "
                 f"no effect (st=0 == st=1).")
+        else:
+            print(f"[Checkpoint] Warning: {exlora_file.name} missing from {ckpt_dir}; "
+                  f"ExLoRA stays zero-initialised (no effect)")
         if has_ckpt_base:
             load_analora_state_dict(transformer, analora_file, "cpu")
             print("[Checkpoint] AnaLoRA loaded from checkpoint")
@@ -313,6 +320,7 @@ def load_pipeline(args, device):
 
 @torch.no_grad()
 def compute_text_embeddings(prompts, tokenizer, text_encoder):
+    """Encode ``prompts`` with the Klein text encoder; returns ``(prompt_embeds, text_ids)``."""
     prompt_embeds = Flux2KleinPipeline._get_qwen3_prompt_embeds(
         text_encoder=text_encoder,
         tokenizer=tokenizer,
@@ -328,6 +336,7 @@ def compute_text_embeddings(prompts, tokenizer, text_encoder):
 # ---------------------------------------------------------------------------
 
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+    """Timestep-shift ``mu`` of the FLUX.2 schedule for ``image_seq_len`` latent tokens and ``num_steps`` steps."""
     a1, b1 = 8.73809524e-05, 1.89833333
     a2, b2 = 0.00016927, 0.45666666
     if image_seq_len > 4300:
@@ -340,6 +349,7 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
 
 
 def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32):
+    """Scheduler sigmas at ``timesteps``, reshaped to broadcast over ``n_dim``-dimensional latents."""
     sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
     schedule_timesteps = noise_scheduler.timesteps.to(device)
     timesteps = timesteps.to(device)
@@ -420,12 +430,6 @@ def prepare_analogy_latents(pipe, batch, resolution=512):
     )
 
 
-def _encode_image(pipe, img: Image.Image, resolution: int = TRAIN_SIZE):
-    """VAE-encode ``img`` exactly as training does (``encode_single_image``): resized to
-    ``resolution`` x ``resolution`` (or the SIA_NATIVE_RES size) without keeping aspect ratio."""
-    return encode_single_image(pipe, img, resolution)
-
-
 # ---------------------------------------------------------------------------
 # Denoising
 # ---------------------------------------------------------------------------
@@ -456,14 +460,15 @@ def run_inference(pipe, tokenizer, text_encoder,
                call consumes the global RNG and every cell sees different
                noise, confounding the ablation.
 
-    Images are encoded at TRAIN_SIZE x TRAIN_SIZE, matching training. The
-    square output is resized back to B's size before it is returned.
+    Images are encoded as in training (``encode_single_image``): at the native 384x512 by
+    default, or TRAIN_SIZE x TRAIN_SIZE with SIA_NATIVE_RES=0. The output is resized back to B's
+    size before it is returned.
     """
     dtype = torch.bfloat16
 
-    lat_a       = _encode_image(pipe, image_a,       TRAIN_SIZE)
-    lat_a_prime = _encode_image(pipe, image_a_prime, TRAIN_SIZE)
-    lat_b       = _encode_image(pipe, image_b,       TRAIN_SIZE)
+    lat_a       = encode_single_image(pipe, image_a,       TRAIN_SIZE)
+    lat_a_prime = encode_single_image(pipe, image_a_prime, TRAIN_SIZE)
+    lat_b       = encode_single_image(pipe, image_b,       TRAIN_SIZE)
 
     if prompt_embeds_schedule is not None and len(prompt_embeds_schedule) > 0:
         if len(prompt_embeds_schedule) != num_steps:
@@ -769,9 +774,6 @@ def log_exlora_validation(pipeline, train_dataset, tokenizer, text_encoder,
             B' (AnaLoRA total prompt),
             B' (AnaLoRA partial prompt),
             B' (ExLoRA)
-
-    The "all suppressed -> expect B" sanity-check column has been removed
-    entirely (not computed, not displayed).
     """
     print(f"Running ExLoRA analogy validation at step {global_step}...")
 
@@ -1006,7 +1008,6 @@ def log_exlora_validation(pipeline, train_dataset, tokenizer, text_encoder,
     #   2. AnaLoRA partial prompt  — suppressed edit(s) stripped, ExLoRA off
     #   3. ExLoRA                    — full prompt + token mask for this kept_set
     # Column 1 doesn't depend on kept_set, so it's computed once and reused.
-    # (The previous "all suppressed -> expect B" column has been removed.)
     # ------------------------------------------------------------------
     pred_base_total_shared = run_denoising(exlora_scale=0.0)
 

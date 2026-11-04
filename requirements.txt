@@ -1,6 +1,6 @@
 # FLUX.2-Klein backbone (tested with Python 3.12 and torch 2.14).
 # The Qwen-Image-2.1 backbone needs newer libraries: use requirements-qwen.txt instead.
-torch>=2.8
+torch>=2.8,<2.15
 torchvision
 numpy==2.2.6
 pillow

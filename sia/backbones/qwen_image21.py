@@ -301,7 +301,7 @@ class Qwen21Conditions:
 
     @property
     def target_size(self):
-        # The output takes the last condition image's (B's) size.
+        """Size (w, h) of the output: that of the last condition image (B)."""
         return self.image_sizes[-1]
 
 
@@ -389,6 +389,7 @@ def predict_velocity(transformer, cond: Qwen21Conditions, target_tokens, timeste
 
 @torch.no_grad()
 def decode_latents(pipe, latents, width, height):
+    """VAE-decode packed ``latents`` of a ``width`` x ``height`` image into an RGB PIL image."""
     latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor).to(pipe.vae.dtype)
     z_dim = pipe.vae.config.z_dim
     mean = torch.tensor(pipe.vae.config.latents_mean).view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)

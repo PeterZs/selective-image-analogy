@@ -352,10 +352,13 @@ def load_analora_from_peft_checkpoint(model, ckpt_path, device="cpu"):
 
 
 def find_latest_checkpoint(output_dir):
-    """Return the highest-step ``checkpoint-<N>`` directory in ``output_dir``, or ``None``."""
+    """Return the highest-step ``checkpoint-<N>`` directory in ``output_dir``, or ``None``.
+
+    Entries whose name is not ``checkpoint-`` followed by digits are ignored.
+    """
     if not os.path.isdir(output_dir):
         return None
-    dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint")]
+    dirs = [d for d in os.listdir(output_dir) if re.fullmatch(r"checkpoint-\d+", d)]
     if not dirs:
         return None
     dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))

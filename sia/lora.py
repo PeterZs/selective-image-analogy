@@ -45,6 +45,7 @@ class AnaLoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x):
+        """Base output plus the scaled low-rank update, on every token."""
         y = self.base(x)
 
         y_prev_dtype = y.dtype
@@ -106,6 +107,7 @@ class ExLoRALinear(nn.Module):
         self._token_mask = mask
 
     def forward(self, x):
+        """Base output plus the scaled low-rank update on the masked tokens only (base output if no mask is set)."""
         if self._token_mask is None:
             return self.base(x)
 

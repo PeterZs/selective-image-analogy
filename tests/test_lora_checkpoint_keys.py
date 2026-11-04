@@ -9,12 +9,12 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
-from safetensors import safe_open
 from safetensors.torch import save_file
 
 from sia.adapters import (
     checkpoint_files,
     checkpoint_lora_rank,
+    find_latest_checkpoint,
     inject_analora_modules,
     inject_exlora_modules,
     load_exlora_state_dict,
@@ -24,8 +24,7 @@ from sia.adapters import (
 )
 from sia.lora import AnaLoRALinear, ExLoRALinear
 
-HUB_SNAPSHOTS = Path("/workspace/.hf_home/hub/models--selective-image-analogy--SIA-weights/snapshots")
-LOCAL_EXPERIMENTS = Path("/workspace/selective-image-analogy/experiments")
+WEIGHTS_REPO = "selective-image-analogy/SIA-weights"
 
 
 class TinyBlock(nn.Module):
@@ -174,51 +173,30 @@ def test_checkpoint_lora_rank_checks_config(tmp_path):
         checkpoint_lora_rank(tmp_path, state)
 
 
+def test_find_latest_checkpoint_ignores_non_numeric_names(tmp_path):
+    assert find_latest_checkpoint(tmp_path / "missing") is None
+    assert find_latest_checkpoint(tmp_path) is None
+    for name in ("checkpoint-500", "checkpoint-2000", "checkpoint-250", "checkpoint-best", "checkpoints"):
+        (tmp_path / name).mkdir()
+    assert find_latest_checkpoint(tmp_path) == str(tmp_path / "checkpoint-2000")
+
+
 # ---------------------------------------------------------------------------
-# Released weights (HF cache) against the original training checkpoints
+# Released weights (HF cache)
 # ---------------------------------------------------------------------------
 
-def latest_snapshot():
-    snapshots = sorted(HUB_SNAPSHOTS.glob("*")) if HUB_SNAPSHOTS.is_dir() else []
-    if not snapshots:
-        pytest.skip("SIA-weights snapshot not in the HF cache")
-    return snapshots[-1]
-
-
-def tensor_shapes(path):
-    """{tensor name: shape} of a .safetensors or .pt file, without loading .safetensors data."""
-    path = Path(path)
-    if path.suffix == ".safetensors":
-        with safe_open(str(path), framework="pt") as f:
-            return {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
-    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    return {k: tuple(v.shape) for k, v in state.items()}
-
-
-RELEASE_VS_LOCAL = [
-    ("flux2_klein/analora/pytorch_lora_weights.safetensors",
-     "analora_klein_native/checkpoint-2000/pytorch_lora_weights.safetensors"),
-    ("flux2_klein/exlora/analora.safetensors", "exlora_klein_native/checkpoint-250/base_lora.pt"),
-    ("flux2_klein/exlora/exlora.safetensors", "exlora_klein_native/checkpoint-250/selective_lora.pt"),
-    ("qwen_image21/analora/pytorch_lora_weights.safetensors",
-     "analora_qwen21/checkpoint-2000/pytorch_lora_weights.safetensors"),
-    ("qwen_image21/exlora/analora.safetensors", "exlora_qwen21/checkpoint-5000/base_lora.pt"),
-    ("qwen_image21/exlora/exlora.safetensors", "exlora_qwen21/checkpoint-5000/selective_lora.pt"),
-]
-
-
-@pytest.mark.parametrize("released, local", RELEASE_VS_LOCAL)
-def test_released_weights_match_local_checkpoints(released, local):
-    released_path = latest_snapshot() / released
-    local_path = LOCAL_EXPERIMENTS / local
-    if not released_path.exists() or not local_path.exists():
-        pytest.skip(f"missing {released_path if not released_path.exists() else local_path}")
-    assert tensor_shapes(released_path) == tensor_shapes(local_path)
+def cached_release_file(filename):
+    """Local path of ``filename`` in the cached SIA-weights snapshot; skips when it is not cached."""
+    from huggingface_hub import try_to_load_from_cache
+    path = try_to_load_from_cache(WEIGHTS_REPO, filename)
+    if not isinstance(path, str):
+        pytest.skip(f"{WEIGHTS_REPO}/{filename} not in the Hugging Face cache")
+    return Path(path)
 
 
 @pytest.mark.parametrize("backbone", ["flux2_klein", "qwen_image21"])
 def test_target_modules_match_released_config(backbone):
     module = pytest.importorskip(f"sia.backbones.{backbone}", exc_type=ImportError)
-    config = json.loads((latest_snapshot() / backbone / "exlora" / "config.json").read_text())
+    config = json.loads(cached_release_file(f"{backbone}/exlora/config.json").read_text())
     assert list(module.ANALORA_TARGET_MODULES) == config["analora_target_modules"]
     assert list(module.EXLORA_TARGET_MODULES) == config["exlora_target_modules"]

@@ -84,6 +84,7 @@ def build_training(transformer, args, accelerator, harmonize_fn=None):
 
 
 def setup_flux2_klein(args, accelerator):
+    """Load FLUX.2-Klein with a PEFT AnaLoRA for Stage 1 training; returns a ``TrainingRun``."""
     from diffusers import Flux2KleinPipeline
     from diffusers.models import Flux2Transformer2DModel
 
@@ -138,6 +139,7 @@ def setup_flux2_klein(args, accelerator):
 
 
 def setup_qwen_image21(args, accelerator):
+    """Load Qwen-Image-2.1 with a PEFT AnaLoRA for Stage 1 training; returns a ``TrainingRun``."""
     from diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel
 
     from sia.backbones import qwen_image21 as bb
@@ -182,6 +184,7 @@ SETUP = {"flux2_klein": setup_flux2_klein, "qwen_image21": setup_qwen_image21}
 # ---------------------------------------------------------------------------
 
 def main():
+    """Train AnaLoRA (Stage 1) with the configuration given on the command line."""
     args = parse_args(print_args=True)
     backbone = backbone_name(args)
     accelerator = start_run(args)

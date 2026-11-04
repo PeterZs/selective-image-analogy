@@ -166,6 +166,18 @@ def test_get_or_build_reads_the_cache_without_sampling(tmp_path):
     assert meta["source"] == "cache" and meta["pre_normalization_norm"] == 7.5
 
 
+@pytest.mark.parametrize("requested, warns", [(64, False), (32, True)])
+def test_get_or_build_warns_on_pair_count_mismatch(tmp_path, capsys, requested, warns):
+    backbone = stub_backbone({})
+    folder = tmp_path / "key_add_a_hat"
+    folder.mkdir()
+    torch.save(torch.tensor([0.0, 1.0]), folder / "vector.pt")
+    (folder / "meta.json").write_text(json.dumps({"edit": "add a hat", "cache_version": 2, "n_requested": 64}))
+    v, meta = get_or_build_steering_vector(backbone, "add a hat", requested, None, "cpu", cache_dir=tmp_path)
+    assert torch.equal(v, torch.tensor([0.0, 1.0]))   # reused, never rebuilt
+    assert ("built from 64 pairs, not the requested 32" in capsys.readouterr().out) == warns
+
+
 def test_default_cache_dir_is_per_backbone(monkeypatch, tmp_path):
     from sia.concept_suppression import default_cache_dir
     monkeypatch.setenv("HOME", str(tmp_path))

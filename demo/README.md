@@ -36,6 +36,7 @@ only the kept edits to a new image **B**; the unticked edits are suppressed.
   (`qwen_image21/exlora`), fine-tuned from [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1).
   This demo does not use the concept suppression vector (CSV).
 - **Defaults:** 40 steps, 512 target resolution, seed 0, no classifier-free guidance.
+- **Inputs:** images up to 4096 px per side and 20 megapixels.
 - **Code:** <https://github.com/alimohammadiamirhossein/selective-image-analogy>
 
 ## License and attribution
