@@ -2,9 +2,8 @@
 train_exlora_qwen21.py
 
 ExLoRA (token-gated LoRA from the SIA paper) trainer for the Selective Image
-Analogy project, built on Qwen-Image-2.1. Also holds the Qwen-Image-2.1
-helpers (conditioning, prompt encoding, sampler) shared by the Stage 1
-trainer and the inference script.
+Analogy project, built on Qwen-Image-2.1. The backbone code (conditioning,
+prompt encoding, sampler, loss) lives in sia/backbones/qwen_image21.py.
 
 The method is the same as in train_exlora_flux2_klein.py; what changes is how
 it maps onto the backbone:
@@ -14,7 +13,7 @@ it maps onto the backbone:
   - The transformer is single-stream: there are no text-stream projections.
     ExLoRA therefore wraps the shared attention/MLP projections of every block
     and the token mask gates it to the suppressed edit tokens of the joint
-    text/image sequence (sia/utils/qwen21.py).
+    text/image sequence (sia/backbones/qwen_image21.py).
   - Text and condition tokens are modulated from t=0 (causal_condition), so
     their activations — including the ExLoRA update — are step-independent
     and the prefix KV cache stays valid at inference.
@@ -30,19 +29,15 @@ Usage:
       --config training/configs/train_exlora_qwen21.yaml
 """
 
-import contextlib
 import itertools
 import math
 import os
 import random
 import sys
 import textwrap
-from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
@@ -63,18 +58,9 @@ if _USE_WANDB:
 
 from accelerate import Accelerator  # noqa: E402
 from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, set_seed  # noqa: E402
-from diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel  # noqa: E402
-from diffusers.models.transformers.transformer_qwenimage21 import (  # noqa: E402
-    _IMG_TOKENS_PER_SLOT,
-    QwenImage21KVCache,
-)
+from diffusers import QwenImage21Transformer2DModel  # noqa: E402
 from diffusers.optimization import get_scheduler  # noqa: E402
-from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import (  # noqa: E402
-    calculate_shift,
-    retrieve_timesteps,
-)
-from diffusers.training_utils import cast_training_params, compute_density_for_timestep_sampling  # noqa: E402
-from diffusers.utils.torch_utils import randn_tensor  # noqa: E402
+from diffusers.training_utils import cast_training_params  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
@@ -88,7 +74,6 @@ from sia.data import (  # noqa: E402
 from sia.adapters import (  # noqa: E402
     collect_analora_params,
     collect_exlora_params,
-    exlora_token_mask_ctx,
     inject_analora_modules,
     inject_exlora_modules,
     load_analora_from_peft_checkpoint,
@@ -102,272 +87,18 @@ from sia.adapters import (  # noqa: E402
 from sia.hf import resolve_checkpoint  # noqa: E402
 from sia.lora import AnaLoRALinear  # noqa: E402
 from sia.prompt import build_analogy_prompt  # noqa: E402
-from sia.utils.qwen21 import (  # noqa: E402
-    qwen21_joint_token_mask,
-    qwen21_resize_dims,
+from sia.backbones.qwen_image21 import (  # noqa: E402
+    ANALORA_TARGET_MODULES,
+    EXLORA_TARGET_MODULES,
+    backward_per_sample,
+    encode_prompt,
+    generate_qwen21,
+    harmonize_images_qwen21,
+    load_pipeline_qwen21,
+    prepare_conditions,
     qwen21_text_token_mask,
+    sample_flow_loss,
 )
-
-# ---------------------------------------------------------------------------
-# Target modules. Every block is single-stream, so the same projections carry
-# text and image tokens. AnaLoRA adapts all of them for every token; ExLoRA
-# wraps the same projections but only fires on the masked edit tokens — the
-# single-stream equivalent of the Klein ExLoRA on the text-stream layers.
-# ---------------------------------------------------------------------------
-QWEN21_LORA_TARGET_MODULES = [
-    "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
-    "img_mlp.proj", "img_mlp.gate_layer", "img_mlp.out",
-]
-ANALORA_TARGET_MODULES = QWEN21_LORA_TARGET_MODULES
-EXLORA_TARGET_MODULES = QWEN21_LORA_TARGET_MODULES
-
-
-# ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-
-def harmonize_images_qwen21(a, a_prime, b, b_prime):
-    """Snap A' to A's size and B' to B's size (same subject, same crop).
-
-    Unlike the Klein rule nothing is downscaled here: the final resize happens
-    at encode time with the pipeline's own rule (``qwen21_resize_dims``).
-    """
-    if a_prime.size != a.size:
-        a_prime = a_prime.resize(a.size, Image.LANCZOS)
-    if b_prime.size != b.size:
-        b_prime = b_prime.resize(b.size, Image.LANCZOS)
-    return a, a_prime, b, b_prime
-
-
-def _to_rgba(img):
-    # The Qwen-Image-2.1 VAE reads RGBA; the pipeline converts every condition image.
-    return img if img.mode == "RGBA" else img.convert("RGBA")
-
-
-def flatten_rgba(img):
-    """Composite an RGBA output over white, as the pipeline does for the encoder."""
-    if img.mode != "RGBA":
-        return img.convert("RGB")
-    white = Image.new("RGB", img.size, (255, 255, 255))
-    white.paste(img, mask=img.getchannel("A"))
-    return white
-
-
-# ---------------------------------------------------------------------------
-# Qwen-Image-2.1 model helpers (mirror QwenImage21Pipeline.__call__)
-# ---------------------------------------------------------------------------
-
-def load_pipeline_qwen21(pretrained_model_name_or_path):
-    """Load the full pipeline in bf16. Going through ``from_pretrained`` keeps
-    the checkpoint's own config (e.g. Turbo's ``sample_sigmas``)."""
-    return QwenImage21Pipeline.from_pretrained(pretrained_model_name_or_path, dtype=torch.bfloat16)
-
-
-@dataclass
-class Qwen21Conditions:
-    """The condition images A, A', B as the pipeline prepares them."""
-    vl_images: list        # RGBA PIL at encode size — what encode_prompt receives
-    image_sizes: list      # (w, h) per condition image
-    latents: torch.Tensor  # (1, N_cond, C) packed, normalised VAE latents
-    img_shapes: list       # (1, h, w) latent grid per condition image
-
-    @property
-    def target_size(self):
-        # The output takes the last condition image's (B's) size.
-        return self.image_sizes[-1]
-
-
-@torch.no_grad()
-def encode_image_latents(pipe, img, width, height, device):
-    """VAE-encode one image exactly as ``QwenImage21Pipeline.prepare_latents``
-    does. Returns packed latents ``(1, h*w, C)`` and the grid ``(1, h, w)``."""
-    pixels = pipe.image_processor.preprocess(_to_rgba(img), width=width, height=height).unsqueeze(2)
-    latents = pipe._encode_vae_image(pixels.to(device=device, dtype=pipe.vae.dtype), generator=None)
-    _, channels, _, h, w = latents.shape
-    return pipe._pack_latents(latents, 1, channels, h, w), (1, h, w)
-
-
-@torch.no_grad()
-def prepare_conditions(pipe, images, resolution, device) -> Qwen21Conditions:
-    """One resize per condition image feeds both the text encoder and the VAE
-    (pipeline step 1), at ``resolution**2`` area and the image's own aspect."""
-    vl_images, sizes, latents, shapes = [], [], [], []
-    for img in images:
-        img = _to_rgba(img)
-        w, h = qwen21_resize_dims(img.width, img.height, resolution)
-        vl_images.append(pipe.image_processor.resize(img, width=w, height=h))
-        tokens, shape = encode_image_latents(pipe, img, w, h, device)
-        sizes.append((w, h))
-        latents.append(tokens)
-        shapes.append(shape)
-    return Qwen21Conditions(vl_images, sizes, torch.cat(latents, dim=1), shapes)
-
-
-@torch.no_grad()
-def encode_prompt(pipe, prompt, cond: Qwen21Conditions, device):
-    """Joint Qwen3-VL encoding of the prompt and the condition images.
-    Returns ``prompt_embeds (1, S, D)`` and ``image_pad_mask (1, S)``."""
-    prompt_embeds, _, image_pad_mask = pipe._get_qwen_prompt_embeds([prompt], cond.vl_images, device)
-    return prompt_embeds, image_pad_mask
-
-
-def build_img_mask(image_pad_mask, n_target_tokens):
-    """The transformer's ``img_mask``: vision slots plus one slot per 2x2
-    group of target tokens."""
-    target_slots = image_pad_mask.new_ones(image_pad_mask.shape[0], n_target_tokens // _IMG_TOKENS_PER_SLOT)
-    return torch.cat([image_pad_mask, target_slots], dim=1)
-
-
-def qwen21_mu(scheduler, image_seq_len):
-    """Resolution-dependent shift, computed as in the pipeline."""
-    cfg = scheduler.config
-    return calculate_shift(
-        image_seq_len,
-        cfg.get("base_image_seq_len", 256),
-        cfg.get("max_image_seq_len", 4096),
-        cfg.get("base_shift", 0.5),
-        cfg.get("max_shift", 1.15),
-    )
-
-
-def sample_train_sigma(scheduler, n_target_tokens, weighting_scheme="none", shift=True):
-    """Draw one training sigma in [0, 1]. With ``shift`` the uniform (or
-    logit-normal) draw goes through the same exponential time shift the
-    sampler applies at this target size."""
-    u = compute_density_for_timestep_sampling(
-        weighting_scheme, batch_size=1, logit_mean=0.0, logit_std=1.0, mode_scale=1.29)
-    if shift and scheduler.config.use_dynamic_shifting:
-        u = scheduler.time_shift(qwen21_mu(scheduler, n_target_tokens), 1.0, u)
-    return u
-
-
-def predict_velocity(transformer, cond: Qwen21Conditions, target_tokens, timestep,
-                     prompt_embeds, img_mask, target_shape, kv_cache=None, kv_cache_mode=None):
-    """One transformer call: condition latents first, the target last, as in
-    the pipeline. ``timestep`` is sigma in [0, 1]. Returns the target's velocity."""
-    out = transformer(
-        hidden_states=torch.cat([cond.latents, target_tokens], dim=1),
-        timestep=timestep,
-        encoder_hidden_states=prompt_embeds,
-        encoder_hidden_states_mask=None,  # batch of one: nothing is padded
-        img_shapes=[cond.img_shapes + [target_shape]],
-        img_mask=img_mask,
-        kv_cache=kv_cache,
-        kv_cache_mode=kv_cache_mode,
-        return_dict=False,
-    )[0]
-    return out[:, -target_tokens.shape[1]:]
-
-
-@torch.no_grad()
-def decode_latents(pipe, latents, width, height):
-    latents = pipe._unpack_latents(latents, height, width, pipe.vae_scale_factor).to(pipe.vae.dtype)
-    z_dim = pipe.vae.config.z_dim
-    mean = torch.tensor(pipe.vae.config.latents_mean).view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-    std = torch.tensor(pipe.vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-    image = pipe.vae.decode(latents * std + mean, return_dict=False)[0][:, :, 0]
-    return flatten_rgba(pipe.image_processor.postprocess(image, output_type="pil")[0])
-
-
-@torch.no_grad()
-def generate_qwen21(pipe, cond: Qwen21Conditions, prompt_embeds, image_pad_mask,
-                    num_steps, generator=None, exlora_text_mask=None,
-                    use_kv_cache=True, prompt_embeds_schedule=None):
-    """Sample B' with the pipeline's sampler (sigma grid, dynamic shift, prefix
-    KV cache, no CFG). ``exlora_text_mask`` is a ``(1, S)`` mask over
-    ``prompt_embeds`` rows; ``None`` leaves ExLoRA off."""
-    transformer = pipe.transformer
-    device = prompt_embeds.device
-    width, height = cond.target_size
-    h, w = height // pipe.vae_scale_factor, width // pipe.vae_scale_factor
-    channels = transformer.config.in_channels
-
-    latents = randn_tensor((1, 1, channels, h, w), generator=generator, device=device, dtype=prompt_embeds.dtype)
-    latents = pipe._pack_latents(latents, 1, channels, h, w)
-
-    sigmas = pipe.config.sample_sigmas
-    if sigmas is None:
-        sigmas = np.linspace(1.0, 1 / num_steps, num_steps)
-    timesteps, _ = retrieve_timesteps(
-        pipe.scheduler, num_steps, device, sigmas=sigmas, mu=qwen21_mu(pipe.scheduler, latents.shape[1]))
-    pipe.scheduler.set_begin_index(0)
-    if prompt_embeds_schedule is not None and len(prompt_embeds_schedule) != len(timesteps):
-        raise ValueError(f"prompt_embeds_schedule has {len(prompt_embeds_schedule)} entries "
-                         f"for {len(timesteps)} steps.")
-
-    img_mask = build_img_mask(image_pad_mask, latents.shape[1])
-    joint_mask = None
-    if exlora_text_mask is not None:
-        joint_mask = qwen21_joint_token_mask(exlora_text_mask, img_mask)
-
-    # A per-step embedding schedule changes the prefix every step, so the
-    # prefix cannot be cached then.
-    cache = None
-    if use_kv_cache and transformer.config.causal_condition and prompt_embeds_schedule is None:
-        cache = QwenImage21KVCache(len(transformer.transformer_blocks))
-
-    for i, t in enumerate(timesteps):
-        kv_mode = ("extract" if i == 0 else "cached") if cache is not None else None
-        embeds = prompt_embeds_schedule[i] if prompt_embeds_schedule is not None else prompt_embeds
-        # ExLoRA only gates prompt tokens, and a cached step recomputes the
-        # target tokens alone — their prefix K/V already carry the update.
-        with exlora_token_mask_ctx(transformer, None if kv_mode == "cached" else joint_mask):
-            noise_pred = predict_velocity(
-                transformer, cond, latents, t.expand(1).to(latents.dtype) / 1000,
-                embeds, img_mask, (1, h, w), cache, kv_mode)
-        latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-    return decode_latents(pipe, latents, width, height)
-
-
-def sample_flow_loss(pipe, transformer, images, b_prime, prompt, resolution, device,
-                     args, suppress_texts=None):
-    """Flow-matching loss for one (A, A', B) -> B' sample.
-
-    ``suppress_texts``: edit strings whose tokens gate ExLoRA (paper eq. 14);
-    ``None`` runs with ExLoRA off. The mask is left set on return so the
-    gradient-checkpointing recompute in backward sees it.
-    """
-    cond = prepare_conditions(pipe, images, resolution, device)
-    target, target_shape = encode_image_latents(pipe, b_prime, *cond.target_size, device)
-    prompt_embeds, image_pad_mask = encode_prompt(pipe, prompt, cond, device)
-    img_mask = build_img_mask(image_pad_mask, target.shape[1])
-
-    joint_mask = None
-    if suppress_texts is not None:
-        text_mask = qwen21_text_token_mask(
-            pipe, prompt, suppress_texts, cond.image_sizes, prompt_embeds.shape[1], device)
-        joint_mask = qwen21_joint_token_mask(text_mask, img_mask)
-
-    sigma = sample_train_sigma(
-        pipe.scheduler, target.shape[1],
-        weighting_scheme=args.get("weighting_scheme", "none"),
-        shift=args.get("shift_train_sigmas", True),
-    ).to(device=device, dtype=target.dtype)
-    noise = torch.randn_like(target)
-    noisy = (1.0 - sigma) * target + sigma * noise
-
-    with exlora_token_mask_ctx(transformer, joint_mask, disable_mask_after=False):
-        pred = predict_velocity(transformer, cond, noisy, sigma, prompt_embeds, img_mask, target_shape)
-    return F.mse_loss(pred.float(), (noise - target).float())
-
-
-def backward_per_sample(accelerator, model, losses_fn, bsz, extra_loss_fn=None):
-    """Run ``losses_fn(i)`` and backward for each sample in turn, averaging
-    over the batch. Gradients sync only on the last backward; ``extra_loss_fn``
-    (e.g. the AnaLoRA anchor) joins that one. Returns the mean sample loss."""
-    total = 0.0
-    for i in range(bsz):
-        is_last = i == bsz - 1
-        ctx = contextlib.nullcontext() if is_last else accelerator.no_sync(model)
-        with ctx:
-            loss = losses_fn(i) / bsz
-            total += loss.detach().item()
-            if is_last and extra_loss_fn is not None:
-                loss = loss + extra_loss_fn()
-            accelerator.backward(loss)
-    return total
-
 
 # ---------------------------------------------------------------------------
 # Strip rendering (validation)

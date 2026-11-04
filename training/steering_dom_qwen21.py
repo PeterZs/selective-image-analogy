@@ -41,7 +41,7 @@ from training.steering_dom import (
     _parse_jsonl_records,
     _write_jsonl,
 )
-from sia.utils.qwen21 import qwen21_find_substring_token_indices
+from sia.backbones.qwen_image21 import qwen21_find_substring_token_indices
 
 
 @torch.no_grad()

@@ -35,39 +35,20 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import numpy as np
 import torch
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw, ImageFont
 
-from diffusers import Flux2KleinPipeline
-from diffusers.pipelines.flux2.pipeline_flux2_klein import retrieve_timesteps
-
-from sia.adapters import (
-    checkpoint_files,
-    checkpoint_lora_rank,
-    exlora_token_mask_ctx,
-    find_latest_checkpoint,
-    inject_analora_modules,
-    inject_exlora_modules,
-    load_analora_from_peft_checkpoint,
-    load_analora_state_dict,
-    load_exlora_state_dict,
-    load_tensors,
-    lora_mode_ctx,
-)
-from sia.hf import resolve_checkpoint
-from sia.klein_tokens import klein_find_substring_token_indices, klein_templated_prompt_token_positions
-from sia.prompt import build_analogy_prompt
-from training.train_exlora_flux2_klein import (
-    ANALORA_TARGET_MODULES,
-    EXLORA_TARGET_MODULES,
-    build_token_mask,
-    compute_empirical_mu,
+from sia.backbones.flux2_klein import (
     compute_text_embeddings,
-    encode_single_image,
-    load_models,
+    klein_templated_prompt_token_positions,
+    load_pipeline,
+    run_inference,
+    templated_substring_indices,
 )
+from sia.prompt import build_analogy_prompt
+# Imported for its side effect: the accelerate compatibility patch must be active before models load.
+import training.train_exlora_flux2_klein  # noqa: F401
 from training.steering_dom import get_or_build_steering_vector
 
 
@@ -117,71 +98,6 @@ def _cell_dims(ref_img: Image.Image, cell_size: int) -> tuple:
     return cell_w, cell_h
 
 
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_pipeline(args, device):
-    """Klein pipeline with AnaLoRA + ExLoRA loaded.
-
-    Weights come from ``args.checkpoint_dir`` (local dir or Hub path, see ``sia.hf.resolve_checkpoint``)
-    or else the latest checkpoint in ``args.output_dir``. A Stage-2 checkpoint carries its own AnaLoRA;
-    only without one is the Stage-1 AnaLoRA read from ``args.analora_path``.
-    """
-    tokenizer, text_encoder, vae, transformer, scheduler = load_models(args)
-
-    explicit_ckpt = getattr(args, "checkpoint_dir", None)
-    if explicit_ckpt:
-        # Fail loud: a wrong path must not silently leave ExLoRA zero-initialised.
-        ckpt_dir = resolve_checkpoint(explicit_ckpt)
-    else:
-        ckpt_dir = find_latest_checkpoint(args.output_dir)
-
-    # Take the rank from the weights so a config/checkpoint rank mismatch can't break loading.
-    analora_file, exlora_file = checkpoint_files(ckpt_dir) if ckpt_dir else (None, None)
-    has_ckpt_base = analora_file is not None and analora_file.exists()
-    if has_ckpt_base:
-        rank = checkpoint_lora_rank(ckpt_dir, load_tensors(analora_file))
-        if rank != args.lora_rank:
-            print(f"[Checkpoint] lora_rank {args.lora_rank} in config -> {rank} from checkpoint")
-            args.lora_rank = rank
-
-    n_base = inject_analora_modules(transformer, ANALORA_TARGET_MODULES,
-                                      r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
-    print(f"[AnaLoRA] Injected {len(n_base)} modules")
-    if not has_ckpt_base:
-        load_analora_from_peft_checkpoint(transformer, resolve_checkpoint(args.analora_path), device="cpu")
-
-    n_st = inject_exlora_modules(transformer, EXLORA_TARGET_MODULES,
-                                         r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
-    print(f"[ExLoRA] Injected {len(n_st)} modules")
-
-    if ckpt_dir:
-        print(f"[Checkpoint] Loading from {ckpt_dir}")
-        if exlora_file.exists():
-            load_exlora_state_dict(transformer, exlora_file)
-        elif explicit_ckpt:
-            # Most likely an AnaLoRA-only run picked by mistake: refuse to run with zero-init ExLoRA.
-            raise FileNotFoundError(
-                f"{exlora_file.name} missing from {ckpt_dir}\n"
-                f"  Files present: {sorted(os.listdir(ckpt_dir))}\n"
-                f"  Without this file ExLoRA is zero-initialised and has "
-                f"no effect (st=0 == st=1).")
-        if has_ckpt_base:
-            load_analora_state_dict(transformer, analora_file, "cpu")
-            print("[Checkpoint] AnaLoRA loaded from checkpoint")
-    else:
-        print("[Checkpoint] No checkpoint found — using freshly initialised weights")
-
-    pipe = Flux2KleinPipeline(
-        transformer=transformer, vae=vae,
-        text_encoder=text_encoder, tokenizer=tokenizer, scheduler=scheduler,
-    )
-    pipe = pipe.to(device=device, dtype=torch.bfloat16)
-    pipe.transformer.eval()
-    return pipe, tokenizer, text_encoder
-
-
 SCALE_VALUES = [0.0, 0.25, 0.5, 0.75, 1.0]  # overridden by --scale_values
 
 
@@ -206,20 +122,6 @@ SCALE_VALUES = [0.0, 0.25, 0.5, 0.75, 1.0]  # overridden by --scale_values
 # ---------------------------------------------------------------------------
 
 
-def templated_substring_indices(prompt: str, substr: str, tokenizer,
-                                max_length: int = 512):
-    """Thin wrapper around the canonical chat-template-aware substring
-    locator. Returns ``[]`` when the substring is missing instead of
-    raising — kept for backward compatibility with old callers in this
-    file that treat "not found" as a soft signal.
-    """
-    try:
-        return klein_find_substring_token_indices(
-            prompt, substr, tokenizer,
-            max_length=max_length,
-        )
-    except AssertionError:
-        return []
 
 
 STEERING_SCOPES = ("tokens", "prompt")
@@ -424,141 +326,6 @@ def format_schedule_tag(schedule) -> str:
         tag_a = f"{alpha:+.1f}".replace(".", "p").replace("+", "")
         parts.append(f"{boundary}a{tag_a}")
     return "sched_" + "_".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-# Max side of the longer dimension used during training.
-# Keep in sync with configs/train_exlora_flux2_klein.yaml  resolution: 512
-TRAIN_SIZE = 512
-
-
-def _encode_image(pipe, img: Image.Image, resolution: int = TRAIN_SIZE):
-    """VAE-encode ``img`` exactly as training does (``encode_single_image``):
-    resized to ``resolution`` x ``resolution`` without keeping aspect ratio.
-    The checkpoints only ever saw square, stretched inputs, so encoding at the
-    native aspect ratio here would put them off-distribution."""
-    return encode_single_image(pipe, img, resolution)
-
-
-@torch.no_grad()
-def run_inference(pipe, tokenizer, text_encoder,
-                  image_a, image_a_prime, image_b,
-                  prompt, texts_to_suppress, num_steps, device,
-                  analora_scale: float = 1.0, exlora_scale: float = 1.0,
-                  prompt_embeds_override: torch.Tensor = None,
-                  prompt_embeds_schedule: list = None,
-                  generator: "torch.Generator | None" = None):
-    """
-    texts_to_suppress: list of edit strings whose tokens are masked for ExLoRA.
-                       Pass [] for no suppression.
-    analora_scale / exlora_scale: multiplier in [0, 1] for each LoRA's strength.
-    prompt_embeds_override: optional precomputed (possibly steered) prompt embeds
-                            to use instead of re-encoding from `prompt`. When
-                            provided, `prompt` is still used for token-mask
-                            substring alignment.
-    prompt_embeds_schedule: optional list of prompt_embed tensors (one per
-                            denoising step). When given, the embedding fed to
-                            the transformer is swapped per step — used to
-                            implement a time-varying steering-alpha schedule.
-    generator: optional ``torch.Generator`` used to sample the initial noise.
-               Pass a freshly seeded generator per sweep cell to keep the
-               initial noise fixed across the ablation axis — otherwise each
-               call consumes the global RNG and every cell sees different
-               noise, confounding the ablation.
-
-    Images are encoded at TRAIN_SIZE x TRAIN_SIZE, matching training. The
-    square output is resized back to B's size before it is returned.
-    """
-    dtype = torch.bfloat16
-
-    lat_a       = _encode_image(pipe, image_a,       TRAIN_SIZE)
-    lat_a_prime = _encode_image(pipe, image_a_prime, TRAIN_SIZE)
-    lat_b       = _encode_image(pipe, image_b,       TRAIN_SIZE)
-
-    if prompt_embeds_schedule is not None and len(prompt_embeds_schedule) > 0:
-        if len(prompt_embeds_schedule) != num_steps:
-            raise ValueError(
-                f"prompt_embeds_schedule has {len(prompt_embeds_schedule)} entries "
-                f"but num_steps={num_steps} — must be one embed per step.")
-        prompt_embeds = prompt_embeds_schedule[0]
-        text_ids = Flux2KleinPipeline._prepare_text_ids(prompt_embeds).to(prompt_embeds.device)
-    elif prompt_embeds_override is not None:
-        prompt_embeds = prompt_embeds_override
-        text_ids = Flux2KleinPipeline._prepare_text_ids(prompt_embeds).to(prompt_embeds.device)
-    else:
-        prompt_embeds, text_ids = compute_text_embeddings([prompt], tokenizer, text_encoder)
-    patch_h, patch_w = lat_a.shape[2], lat_a.shape[3]
-
-    cond_a  = Flux2KleinPipeline._pack_latents(lat_a)
-    cond_ap = Flux2KleinPipeline._pack_latents(lat_a_prime)
-    cond_b  = Flux2KleinPipeline._pack_latents(lat_b)
-    condition_latents = torch.cat([cond_a, cond_ap, cond_b], dim=1)
-
-    if generator is not None:
-        gen_latents = torch.randn(lat_a.shape, device=device, dtype=dtype,
-                                  generator=generator)
-    else:
-        gen_latents = torch.randn(lat_a.shape, device=device, dtype=dtype)
-    gen_latents   = Flux2KleinPipeline._pack_latents(gen_latents)
-    target_ids    = Flux2KleinPipeline._prepare_latent_ids(lat_a).to(device)
-    condition_ids = Flux2KleinPipeline._prepare_image_ids([lat_a, lat_a_prime, lat_b]).to(device)
-    combined_ids  = torch.cat([target_ids, condition_ids], dim=1)
-
-    sigmas       = np.linspace(1.0, 1 / num_steps, num_steps)
-    mu           = compute_empirical_mu(gen_latents.shape[1], num_steps)
-    timesteps, _ = retrieve_timesteps(pipe.scheduler, num_steps, device, sigmas=sigmas, mu=mu)
-
-    # Always build the edit-token mask whenever we *would* use ExLoRA
-    # suppression, even when ``exlora_scale == 0``.  Rely on ``lora_mode_ctx`` to
-    # zero the ExLoRA delta.  (Previously we only set the mask when
-    # ``exlora_scale > 0``, which left ``_token_mask is None`` at st=0; that
-    # short-circuits ``ExLoRALinear`` to ``return self.base(x)`` without
-    # ever going through the adapter path.  For scale=0 the output is the same
-    # either way, but keeping the mask set makes the st=0 vs st=1 comparison
-    # a single "adapter on with zero gain" vs "adapter on with full gain" path
-    # and matches training when you zero scale with a non-None mask.)
-    if texts_to_suppress:
-        token_mask = build_token_mask(
-            prompt, texts_to_suppress, tokenizer, device,
-            max_seq_len=prompt_embeds.shape[1],
-        )
-        if exlora_scale > 0.0:
-            print(f"[ExLoRA] token_mask covers {int(token_mask.sum().item())} "
-                  f"templated-prompt position(s) for {len(texts_to_suppress)} "
-                  f"suppressed edit text(s).")
-    else:
-        token_mask = None
-
-    with lora_mode_ctx(pipe.transformer, analora_scale, exlora_scale), \
-         exlora_token_mask_ctx(pipe.transformer, token_mask, disable_mask_after=True):
-        for step_idx, t in enumerate(timesteps):
-            step_embeds = (prompt_embeds_schedule[step_idx]
-                           if prompt_embeds_schedule is not None
-                           else prompt_embeds)
-            latent_model_input = torch.cat([gen_latents, condition_latents], dim=1)
-            noise_pred = pipe.transformer(
-                hidden_states=latent_model_input,
-                timestep=t.expand(1).to(dtype) / 1000,
-                guidance=None,
-                encoder_hidden_states=step_embeds,
-                txt_ids=text_ids,
-                img_ids=combined_ids,
-                return_dict=False,
-            )[0][:, :gen_latents.shape[1]]
-            gen_latents = pipe.scheduler.step(noise_pred, t, gen_latents, return_dict=False)[0]
-
-    unpacked = gen_latents.permute(0, 2, 1).reshape(1, -1, patch_h, patch_w)
-    bn_mean  = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(unpacked.device, unpacked.dtype)
-    bn_std   = torch.sqrt(pipe.vae.bn.running_var.view(1, -1, 1, 1)
-                          + pipe.vae.config.batch_norm_eps).to(unpacked.device, unpacked.dtype)
-    unpacked = unpacked * bn_std + bn_mean
-    unpacked = Flux2KleinPipeline._unpatchify_latents(unpacked)
-    decoded  = pipe.vae.decode(unpacked, return_dict=False)[0]
-    out = pipe.image_processor.postprocess(decoded, output_type="pil")[0]
-    return out.resize(image_b.size, Image.LANCZOS)
 
 
 # ---------------------------------------------------------------------------

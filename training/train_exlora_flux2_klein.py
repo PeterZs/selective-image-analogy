@@ -58,8 +58,8 @@ from tqdm.auto import tqdm
 
 from accelerate import Accelerator
 from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, set_seed
-from diffusers import FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline
-from diffusers.models import AutoencoderKLFlux2, Flux2Transformer2DModel
+from diffusers import Flux2KleinPipeline
+from diffusers.models import Flux2Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.flux2.pipeline_flux2_klein import retrieve_timesteps
 from diffusers.training_utils import (
@@ -67,12 +67,23 @@ from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
 )
-from huggingface_hub.constants import HF_HUB_OFFLINE
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
-from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from sia.data import DATASET, SelectiveAnalogyDataset, collate_selective, resize_to_match, subject_image
+from sia.backbones.flux2_klein import (
+    ANALORA_TARGET_MODULES,
+    EXLORA_TARGET_MODULES,
+    _native_wh,
+    build_token_mask,
+    compute_empirical_mu,
+    compute_text_embeddings,
+    encode_single_image,
+    get_sigmas,
+    klein_find_substring_token_indices,  # noqa: F401  (re-exported)
+    load_models,
+    prepare_analogy_latents,
+)
 from sia.adapters import (
     collect_analora_params,
     collect_exlora_params,
@@ -88,7 +99,6 @@ from sia.adapters import (
     set_exlora_requires_grad,
 )
 from sia.hf import resolve_checkpoint
-from sia.klein_tokens import klein_find_substring_token_indices
 from sia.lora import AnaLoRALinear, ExLoRALinear
 from sia.prompt import build_analogy_prompt
 
@@ -116,214 +126,6 @@ try:
 except Exception:
     pass
 # ───────────────────────────────────────────────────────────────────────────
-
-# ---------------------------------------------------------------------------
-# ExLoRA target modules: context (text-stream) layers only.
-# ---------------------------------------------------------------------------
-EXLORA_TARGET_MODULES = [
-    "attn.add_k_proj",
-    "attn.add_q_proj",
-    "attn.add_v_proj",
-    "attn.to_add_out",
-    "ff_context.net.0.proj",
-    "ff_context.net.2",
-]
-
-
-# ---------------------------------------------------------------------------
-# Klein-specific helpers
-# ---------------------------------------------------------------------------
-
-def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
-    a1, b1 = 8.73809524e-05, 1.89833333
-    a2, b2 = 0.00016927, 0.45666666
-    if image_seq_len > 4300:
-        return float(a2 * image_seq_len + b2)
-    m_200 = a2 * image_seq_len + b2
-    m_10 = a1 * image_seq_len + b1
-    a = (m_200 - m_10) / 190.0
-    b = m_200 - 200.0 * a
-    return float(a * num_steps + b)
-
-
-# ---------------------------------------------------------------------------
-# AnaLoRA target modules (same as analora training)
-# ---------------------------------------------------------------------------
-ANALORA_TARGET_MODULES = [
-    "attn.to_k", "attn.to_q", "attn.to_v", "attn.to_out.0",
-    "attn.add_k_proj", "attn.add_q_proj", "attn.add_v_proj",
-    "attn.to_add_out",
-    "ff.net.0.proj", "ff.net.2",
-    "ff_context.net.0.proj", "ff_context.net.2",
-]
-
-
-# ---------------------------------------------------------------------------
-# Token mask helpers (Qwen/Flux2 tokenizer)
-# ---------------------------------------------------------------------------
-
-def build_token_mask(full_prompt, edit_texts, tokenizer, device, max_seq_len=512):
-    """Build a (1, max_seq_len) bool mask covering tokens for each edit text.
-
-    The mask is aligned against the **chat-templated** Qwen prompt — the
-    exact sequence ``Flux2KleinPipeline._get_qwen3_prompt_embeds`` feeds
-    into the text encoder. Mask positions therefore line up with rows of
-    ``prompt_embeds`` and with the ``encoder_hidden_states`` consumed by
-    ``ExLoRALinear``.
-
-    Args:
-        full_prompt:  full prompt string (raw, pre-template)
-        edit_texts:   list of edit strings whose tokens should be masked
-        tokenizer:    Qwen2TokenizerFast
-        device:       target device
-        max_seq_len:  must match max_length used in prompt encoding
-
-    Returns:
-        torch.BoolTensor of shape (1, max_seq_len). If a particular edit
-        cannot be located the function raises — silent zero-masks were the
-        original ExLoRA bug and must never recur.
-    """
-    mask = torch.zeros((1, max_seq_len), device=device, dtype=torch.bool)
-    for text in edit_texts:
-        if not text:
-            continue
-        try:
-            indices = klein_find_substring_token_indices(
-                full_prompt, text, tokenizer,
-                max_length=max_seq_len,
-            )
-        except AssertionError as exc:
-            # Substring not found in the prompt — almost always an edit-text
-            # vs. prompt-builder mismatch. Loud failure is mandatory because
-            # an empty mask silently disables ExLoRA.
-            raise RuntimeError(
-                f"[TokenMask] Could not locate edit text in prompt:\n"
-                f"  edit:   {text!r}\n"
-                f"  prompt: {full_prompt!r}\n"
-                f"  underlying: {exc}"
-            ) from exc
-        for idx in indices:
-            if idx < max_seq_len:
-                mask[0, idx] = True
-
-    if edit_texts and not bool(mask.any()):
-        raise RuntimeError(
-            "[TokenMask] All edit texts produced empty positions — ExLoRA "
-            "would be a no-op. Check tokenizer / prompt format."
-        )
-    return mask
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_models(args):
-    path = args.pretrained_model_name_or_path
-    # The frozen models are cast to bf16 in main() anyway; loading them in bf16
-    # avoids a ~70 GB fp32 copy in host RAM (the LoRA layers stay fp32).
-    # diffusers 0.38 queries the Hub for sharded weights unless local_files_only is
-    # set, so HF_HUB_OFFLINE=1 is passed on explicitly.
-    bf16 = dict(torch_dtype=torch.bfloat16, local_files_only=HF_HUB_OFFLINE)
-    tokenizer = Qwen2TokenizerFast.from_pretrained(path, subfolder="tokenizer")
-    text_encoder = Qwen3ForCausalLM.from_pretrained(path, subfolder="text_encoder", **bf16)
-    vae = AutoencoderKLFlux2.from_pretrained(path, subfolder="vae", **bf16)
-    transformer = Flux2Transformer2DModel.from_pretrained(path, subfolder="transformer", **bf16)
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
-    return tokenizer, text_encoder, vae, transformer, noise_scheduler
-
-
-# ---------------------------------------------------------------------------
-# Text encoding
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def compute_text_embeddings(prompts, tokenizer, text_encoder):
-    prompt_embeds = Flux2KleinPipeline._get_qwen3_prompt_embeds(
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        prompt=prompts,
-    )
-    text_ids = Flux2KleinPipeline._prepare_text_ids(prompt_embeds)
-    text_ids = text_ids.to(prompt_embeds.device)
-    return prompt_embeds, text_ids
-
-
-def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32):
-    sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
-    schedule_timesteps = noise_scheduler.timesteps.to(device)
-    timesteps = timesteps.to(device)
-    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-    sigma = sigmas[step_indices].flatten()
-    while len(sigma.shape) < n_dim:
-        sigma = sigma.unsqueeze(-1)
-    return sigma
-
-
-# ---------------------------------------------------------------------------
-# Latent helpers
-# ---------------------------------------------------------------------------
-
-def _native_wh():
-    """(w, h) from env SIA_NATIVE_RES ("1" -> 384x512, "WxH"), or None for the square 512 recipe."""
-    v = os.environ.get("SIA_NATIVE_RES", "0")
-    if v in ("", "0"):
-        return None
-    w, h = (384, 512) if v == "1" else map(int, v.lower().split("x"))
-    return w // 16 * 16, h // 16 * 16
-
-
-@torch.no_grad()
-def encode_single_image(pipe, img, cell_size=512):
-    """Resize, preprocess, and VAE-encode a single PIL image. Returns (1, C, h, w) latent.
-
-    With SIA_NATIVE_RES set (1 = 384x512, or "WxH") every image is encoded at that fixed
-    non-square size instead of cell_size x cell_size (our data is 384x512 portrait)."""
-    w, h = _native_wh() or (cell_size, cell_size)
-    img = resize_to_match(img, w, h)
-    tensor = pipe.image_processor.preprocess(img, h, w)   # height first
-    tensor = tensor.to(device=pipe._execution_device, dtype=torch.bfloat16)
-    return pipe._encode_vae_image(tensor, generator=None)
-
-
-@torch.no_grad()
-def prepare_analogy_latents(pipe, batch, resolution=512):
-    """Encode A, A', B, B' through VAE and prepare concat-mode latents + IDs.
-
-    Returns:
-        target_latents:    (B, N, C) packed B' latents
-        condition_latents: (B, 3*N, C) packed [A, A', B] condition latents
-        target_ids:        position IDs for target
-        condition_ids:     position IDs for conditions
-    """
-    target_arr, cond_arr = [], []
-
-    for a, a_prime, b, b_prime in zip(
-        batch['A'], batch['A_prime'], batch['B'], batch['B_prime']
-    ):
-        lat_a       = encode_single_image(pipe, a,       resolution)
-        lat_a_prime = encode_single_image(pipe, a_prime, resolution)
-        lat_b       = encode_single_image(pipe, b,       resolution)
-        lat_b_prime = encode_single_image(pipe, b_prime, resolution)
-
-        target_arr.append(Flux2KleinPipeline._pack_latents(lat_b_prime))
-        cond_a  = Flux2KleinPipeline._pack_latents(lat_a).squeeze(0)
-        cond_ap = Flux2KleinPipeline._pack_latents(lat_a_prime).squeeze(0)
-        cond_b  = Flux2KleinPipeline._pack_latents(lat_b).squeeze(0)
-        cond_arr.append(
-            torch.cat([cond_a, cond_ap, cond_b], dim=0).unsqueeze(0))
-
-    target_ids = Flux2KleinPipeline._prepare_latent_ids(lat_b_prime)
-    condition_ids = Flux2KleinPipeline._prepare_image_ids(
-        [lat_a, lat_a_prime, lat_b])
-        
-    return (
-        torch.cat(target_arr, dim=0),
-        torch.cat(cond_arr,   dim=0),
-        target_ids,
-        condition_ids,
-    )
-
 
 # ---------------------------------------------------------------------------
 # Checkpoint helpers

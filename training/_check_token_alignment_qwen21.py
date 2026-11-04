@@ -38,7 +38,7 @@ from diffusers.models.transformers.transformer_qwenimage21 import _IMG_TOKENS_PE
 from PIL import Image  # noqa: E402
 from transformers import Qwen3VLProcessor  # noqa: E402
 
-from sia.utils.qwen21 import (  # noqa: E402
+from sia.backbones.qwen_image21 import (  # noqa: E402
     qwen21_find_substring_token_indices,
     qwen21_joint_token_mask,
     qwen21_prompt_token_positions,

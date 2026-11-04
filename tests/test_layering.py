@@ -1,0 +1,92 @@
+"""Import rule of the package, checked on the source with ``ast`` (nothing is imported or executed).
+
+shared layer (hf, lora, adapters, prompt, data, concept_suppression, viz, backbones)
+    imports nothing role-specific: no ``sia.inference``, ``sia.training``, ``sia.eval``;
+backbones
+    are independent of each other (the Klein env must never import Qwen code and vice versa);
+inference
+    imports the shared layer only;
+nothing under ``sia/``
+    imports the ``training`` or ``scripts`` folders.
+
+Modules that do not exist yet are skipped.
+"""
+import ast
+from pathlib import Path
+
+import pytest
+
+SIA = Path(__file__).resolve().parent.parent / "sia"
+
+SHARED = ["hf.py", "lora.py", "adapters.py", "prompt.py", "data.py", "concept_suppression.py", "csv.py", "viz.py"]
+BACKBONES = ["flux2_klein.py", "qwen_image21.py"]
+ROLE_SPECIFIC = ["sia.inference", "sia.training", "sia.eval"]
+OUTSIDE_PACKAGE = ["training", "scripts"]
+
+
+def module_name(path):
+    """Dotted module name of a file under ``sia/`` (``sia/backbones/qwen_image21.py`` -> ``sia.backbones.qwen_image21``)."""
+    parts = path.relative_to(SIA.parent).with_suffix("").parts
+    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+
+def imported_modules(path):
+    """Absolute names of every module imported anywhere in ``path`` (including function-level imports)."""
+    package = module_name(path) if path.name == "__init__.py" else module_name(path).rpartition(".")[0]
+    names = set()
+    for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:  # relative import
+                base = package.split(".")
+                base = base[:len(base) - node.level + 1]
+                module = ".".join(base + ([node.module] if node.module else []))
+            else:
+                module = node.module
+            names.add(module)
+            # ``from sia import inference`` imports the module sia.inference.
+            names.update(f"{module}.{alias.name}" for alias in node.names)
+    return names
+
+
+def forbidden_imports(path, prefixes):
+    return sorted(name for name in imported_modules(path)
+                  if any(name == p or name.startswith(p + ".") for p in prefixes))
+
+
+def existing(path):
+    if not path.exists():
+        pytest.skip(f"{path.relative_to(SIA.parent)} does not exist yet")
+    return path
+
+
+@pytest.mark.parametrize("filename", SHARED)
+def test_shared_modules_import_nothing_role_specific(filename):
+    path = existing(SIA / filename)
+    assert forbidden_imports(path, ROLE_SPECIFIC + OUTSIDE_PACKAGE) == []
+
+
+@pytest.mark.parametrize("filename", BACKBONES)
+def test_backbones_import_only_the_shared_layer(filename):
+    path = existing(SIA / "backbones" / filename)
+    assert forbidden_imports(path, ROLE_SPECIFIC + OUTSIDE_PACKAGE) == []
+
+
+@pytest.mark.parametrize("filename, other", [
+    ("flux2_klein.py", "sia.backbones.qwen_image21"),
+    ("qwen_image21.py", "sia.backbones.flux2_klein"),
+])
+def test_backbones_do_not_import_each_other(filename, other):
+    path = existing(SIA / "backbones" / filename)
+    assert forbidden_imports(path, [other]) == []
+
+
+def test_inference_imports_only_the_shared_layer():
+    path = existing(SIA / "inference.py")
+    assert forbidden_imports(path, ["sia.training", "sia.eval"] + OUTSIDE_PACKAGE) == []
+
+
+@pytest.mark.parametrize("path", sorted(SIA.rglob("*.py")), ids=lambda p: str(p.relative_to(SIA.parent)))
+def test_package_does_not_import_training_or_scripts(path):
+    assert forbidden_imports(path, OUTSIDE_PACKAGE) == []

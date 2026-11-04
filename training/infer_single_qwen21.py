@@ -30,15 +30,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from training.train_exlora_qwen21 import (  # noqa: E402
-    ANALORA_TARGET_MODULES,
-    EXLORA_TARGET_MODULES,
-    encode_prompt,
-    generate_qwen21,
-    load_pipeline_qwen21,
-    prepare_conditions,
-)
-
 import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -54,76 +45,17 @@ from training.infer_single import (  # noqa: E402
     parse_args as parse_args_klein,
 )
 from training.steering_dom_qwen21 import get_or_build_steering_vector_qwen21  # noqa: E402
-from sia.adapters import (  # noqa: E402
-    checkpoint_files,
-    checkpoint_lora_rank,
-    find_latest_checkpoint,
-    inject_analora_modules,
-    inject_exlora_modules,
-    load_analora_from_peft_checkpoint,
-    load_analora_state_dict,
-    load_exlora_state_dict,
-    load_tensors,
-    lora_mode_ctx,
-)
-from sia.hf import resolve_checkpoint  # noqa: E402
-from sia.prompt import build_analogy_prompt  # noqa: E402
-from sia.utils.qwen21 import (  # noqa: E402
+from sia.adapters import lora_mode_ctx  # noqa: E402
+from sia.backbones.qwen_image21 import (  # noqa: E402
+    encode_prompt,
+    generate_qwen21,
+    load_pipeline,
+    prepare_conditions,
     qwen21_find_substring_token_indices,
     qwen21_prompt_token_positions,
     qwen21_text_token_mask,
 )
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_pipeline(args, device):
-    """Qwen-Image-2.1 pipeline with AnaLoRA + ExLoRA loaded — same checkpoint
-    resolution rules as infer_single.load_pipeline."""
-    pipe = load_pipeline_qwen21(args.pretrained_model_name_or_path)
-    transformer = pipe.transformer
-
-    explicit_ckpt = getattr(args, "checkpoint_dir", None)
-    ckpt_dir = resolve_checkpoint(explicit_ckpt) if explicit_ckpt else find_latest_checkpoint(args.output_dir)
-
-    # A Stage-2 checkpoint carries its own AnaLoRA; take the rank from it.
-    analora_file, exlora_file = checkpoint_files(ckpt_dir) if ckpt_dir else (None, None)
-    has_ckpt_base = analora_file is not None and analora_file.exists()
-    if has_ckpt_base:
-        rank = checkpoint_lora_rank(ckpt_dir, load_tensors(analora_file))
-        if rank != args.lora_rank:
-            print(f"[Checkpoint] lora_rank {args.lora_rank} in config -> {rank} from checkpoint")
-            args.lora_rank = rank
-
-    n_base = inject_analora_modules(transformer, ANALORA_TARGET_MODULES,
-                                    r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
-    print(f"[AnaLoRA] Injected {len(n_base)} modules")
-    if not has_ckpt_base:
-        load_analora_from_peft_checkpoint(transformer, resolve_checkpoint(args.analora_path), device="cpu")
-
-    n_st = inject_exlora_modules(transformer, EXLORA_TARGET_MODULES,
-                                 r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
-    print(f"[ExLoRA] Injected {len(n_st)} modules")
-
-    if ckpt_dir:
-        print(f"[Checkpoint] Loading from {ckpt_dir}")
-        if exlora_file.exists():
-            load_exlora_state_dict(transformer, exlora_file)
-        elif explicit_ckpt:
-            raise FileNotFoundError(
-                f"{exlora_file.name} missing from {ckpt_dir} — without it ExLoRA is "
-                f"zero-initialised and has no effect.")
-        if has_ckpt_base:
-            load_analora_state_dict(transformer, analora_file, "cpu")
-            print("[Checkpoint] AnaLoRA loaded from checkpoint")
-    else:
-        print("[Checkpoint] No checkpoint found — using freshly initialised ExLoRA")
-
-    pipe.to(device)
-    transformer.eval()
-    return pipe
+from sia.prompt import build_analogy_prompt  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

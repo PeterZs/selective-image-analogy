@@ -1,4 +1,4 @@
-"""Injection, masking, saving and loading of the SIA adapters (AnaLoRA and ExLoRA).
+"""Injection, scaling, token masking, saving and loading of the SIA adapters.
 
 Checkpoint layouts:
   AnaLoRA (Stage 1)  pytorch_lora_weights.safetensors (PEFT/diffusers keys)
@@ -20,14 +20,13 @@ from sia.lora import AnaLoRALinear, ExLoRALinear
 
 
 @contextmanager
-def exlora_token_mask_ctx(model, mask: torch.Tensor, disable_mask_after=True):  # mask: (B, S) bool
-    """
-    Context manager to set token mask for all ExLoRALinear modules in the model.
+def exlora_token_mask_ctx(model, mask: torch.Tensor, disable_mask_after=True):
+    """Set the token mask of every ``ExLoRALinear`` in ``model`` for the duration of the block.
 
     Args:
-        model: The model containing ExLoRALinear modules.
-        mask: A boolean tensor of shape (B, S) indicating which tokens to apply LoRA to.
-        disable_mask_after: If True, the token mask will be cleared after exiting the context.
+        model: module containing ``ExLoRALinear`` layers.
+        mask: ``(B, S)`` boolean tensor; ExLoRA is applied where it is true.
+        disable_mask_after: clear the mask (ExLoRA off) when the block exits.
     """
     loras = [m for m in model.modules() if isinstance(m, ExLoRALinear)]
     for m in loras:
@@ -42,7 +41,11 @@ def exlora_token_mask_ctx(model, mask: torch.Tensor, disable_mask_after=True):  
 
 @contextmanager
 def lora_mode_ctx(transformer, analora_scale: float = 1.0, exlora_scale: float = 1.0):
-    """Scale both LoRAs by the given multipliers (0.0 = off, 1.0 = full strength)."""
+    """Scale AnaLoRA and ExLoRA by the given multipliers inside the block (0 = off, 1 = full).
+
+    ``type(m) is AnaLoRALinear`` selects AnaLoRA layers only; the original scalings are
+    restored on exit.
+    """
     base_mods = [m for m in transformer.modules() if type(m) is AnaLoRALinear]
     st_mods   = [m for m in transformer.modules() if isinstance(m, ExLoRALinear)]
     orig_base = [m.scaling for m in base_mods]
@@ -60,6 +63,7 @@ def lora_mode_ctx(transformer, analora_scale: float = 1.0, exlora_scale: float =
 
 
 def _get_parent(model, dotted_name):
+    """Return ``(parent_module, attribute_name)`` for a dotted submodule name."""
     parts = dotted_name.split(".")
     parent = model
     for p in parts[:-1]:
@@ -68,10 +72,20 @@ def _get_parent(model, dotted_name):
 
 
 def inject_exlora_modules(model, target_linear_name_suffixes, r, alpha, dropout):
-    """Wrap the target nn.Linear / AnaLoRALinear modules with ExLoRALinear; returns the wrapped names."""
+    """Wrap every target ``nn.Linear`` / ``AnaLoRALinear`` in an ``ExLoRALinear``.
+
+    Args:
+        model: module to modify in place.
+        target_linear_name_suffixes: a module is wrapped when its qualified name ends with one
+            of these suffixes.
+        r, alpha, dropout: ExLoRA hyperparameters (see ``ExLoRALinear``).
+
+    Returns:
+        Qualified names of the wrapped modules.
+    """
     replaced = []
     for name, module in list(model.named_modules()):
-        if module.__class__.__name__ == "ExLoRALinear":  # Already loaded (Useful for debugging)
+        if module.__class__.__name__ == "ExLoRALinear":
             module = module.base
 
         is_target = isinstance(module, (nn.Linear, AnaLoRALinear))
@@ -85,7 +99,7 @@ def inject_exlora_modules(model, target_linear_name_suffixes, r, alpha, dropout)
 
 
 def save_exlora_state_dict(unwraped_model, output_file_path):
-    """Save the ExLoRALinear lora_A/lora_B weights with ``torch.save`` (keys ``<module>.lora_{A,B}.weight``)."""
+    """Save the ExLoRA weights with ``torch.save`` under keys ``<module>.lora_{A,B}.weight``."""
     ckpt = OrderedDict()
     for name, module in unwraped_model.named_modules():
         if isinstance(module, ExLoRALinear):
@@ -96,7 +110,10 @@ def save_exlora_state_dict(unwraped_model, output_file_path):
 
 
 def inject_analora_modules(model, target_linear_name_suffixes, r, alpha, dropout=0.0):
-    """Wrap target nn.Linear modules with AnaLoRALinear (always-active LoRA)."""
+    """Wrap every target ``nn.Linear`` in an ``AnaLoRALinear``; returns the wrapped names.
+
+    Targets are selected by name suffix, as in ``inject_exlora_modules``.
+    """
     replaced = []
     for name, module in list(model.named_modules()):
         if isinstance(module, nn.Linear) and any(name.endswith(sfx) for sfx in target_linear_name_suffixes):
@@ -108,7 +125,7 @@ def inject_analora_modules(model, target_linear_name_suffixes, r, alpha, dropout
 
 
 def collect_exlora_params(model):
-    """Collect ExLoRALinear's own lora_A/B parameters (not base's)."""
+    """Return the ExLoRA ``lora_A`` / ``lora_B`` weights (excluding any wrapped AnaLoRA)."""
     params = []
     for module in model.modules():
         if isinstance(module, ExLoRALinear):
@@ -118,7 +135,7 @@ def collect_exlora_params(model):
 
 
 def collect_analora_params(model):
-    """Collect AnaLoRALinear's lora_A/B parameters."""
+    """Return the AnaLoRA ``lora_A`` / ``lora_B`` weights, each parameter once."""
     params = []
     seen = set()
     for module in model.modules():
@@ -143,11 +160,14 @@ def set_analora_requires_grad(model, requires_grad: bool):
 
 
 def save_analora_state_dict(model, output_file_path):
-    """Save AnaLoRALinear weights. Strips '.base' suffix for compatibility."""
+    """Save the AnaLoRA weights with ``torch.save``.
+
+    An AnaLoRA wrapped by an ExLoRA is named ``<module>.base``; the suffix is stripped so the
+    keys are ``<module>.lora_{A,B}.weight`` whether or not ExLoRA has been injected.
+    """
     ckpt = OrderedDict()
     for name, module in model.named_modules():
         if isinstance(module, AnaLoRALinear):
-            # If inside a ExLoRALinear, name ends with ".base" — strip it
             save_name = name[:-5] if name.endswith(".base") else name
             ckpt[f"{save_name}.lora_A.weight"] = module.lora_A.weight.cpu()
             ckpt[f"{save_name}.lora_B.weight"] = module.lora_B.weight.cpu()
@@ -155,17 +175,18 @@ def save_analora_state_dict(model, output_file_path):
 
 
 def load_tensors(path, device="cpu"):
-    """Tensor dict from a ``.safetensors`` file or a ``torch.save``d dict (``.pt``)."""
+    """Load a tensor dict from a ``.safetensors`` file or a ``torch.save`` file (``.pt``)."""
     if str(path).endswith(".safetensors"):
         return load_file(path, device=str(device))
     return torch.load(path, map_location=device, weights_only=True)
 
 
 def checkpoint_files(ckpt_dir):
-    """(analora_file, exlora_file) of a Stage-2 checkpoint dir.
+    """Return ``(analora_file, exlora_file)`` of a Stage-2 checkpoint directory.
 
-    Prefers the release names ``analora.safetensors`` / ``exlora.safetensors`` and falls back to the
-    trainer names ``base_lora.pt`` / ``selective_lora.pt``. The returned paths may not exist.
+    The release names ``analora.safetensors`` / ``exlora.safetensors`` are preferred; otherwise
+    the trainer names ``base_lora.pt`` / ``selective_lora.pt`` are returned. The returned paths
+    may not exist.
     """
     ckpt_dir = Path(ckpt_dir)
     analora, exlora = ckpt_dir / "analora.safetensors", ckpt_dir / "exlora.safetensors"
@@ -174,9 +195,10 @@ def checkpoint_files(ckpt_dir):
 
 
 def checkpoint_lora_rank(ckpt_dir, state):
-    """LoRA rank of a checkpoint, from the ``lora_A`` shapes in ``state``.
+    """Return the LoRA rank of a checkpoint, read from the ``lora_A`` shapes in ``state``.
 
-    The adapters use ``alpha = rank``; a ``config.json`` next to the weights must agree with both.
+    The adapters use ``alpha = rank``. If a ``config.json`` sits next to the weights, its
+    ``lora_rank`` and ``lora_alpha`` must agree with that; otherwise ``ValueError`` is raised.
     """
     rank = next(w.shape[0] for k, w in state.items() if k.endswith("lora_A.weight"))
     config = Path(ckpt_dir) / "config.json"
@@ -192,7 +214,8 @@ def checkpoint_lora_rank(ckpt_dir, state):
 def load_exlora_state_dict(model, path):
     """Load ExLoRA weights (``exlora.safetensors`` or ``selective_lora.pt``) into ``model``.
 
-    Non-strict load: every key must belong to the model, and at least one must be an ExLoRA weight.
+    Non-strict load: every key in the file must exist in the model and at least one must be an
+    ExLoRA weight; otherwise an error is raised.
     """
     state = load_tensors(path)
     _, unexpected = model.load_state_dict(state, strict=False)
@@ -207,7 +230,10 @@ def load_exlora_state_dict(model, path):
 
 
 def load_analora_state_dict(model, ckpt_path, device="cpu"):
-    """Load AnaLoRA weights saved by save_analora_state_dict."""
+    """Load AnaLoRA weights written by ``save_analora_state_dict`` (or the release file).
+
+    Raises ``RuntimeError`` unless every AnaLoRA ``lora_A`` / ``lora_B`` in the model is loaded.
+    """
     raw_sd = load_tensors(ckpt_path, device)
 
     analora_map = {}
@@ -240,10 +266,12 @@ def load_analora_state_dict(model, ckpt_path, device="cpu"):
 
 
 def load_analora_from_peft_checkpoint(model, ckpt_path, device="cpu"):
-    """Load a PEFT-format LoRA checkpoint into AnaLoRALinear modules.
+    """Load a PEFT/diffusers LoRA checkpoint directory into the ``AnaLoRALinear`` layers.
 
-    Handles key format: "transformer.{module_path}.lora_A.weight"
-    or "{module_path}.lora_A.weight" (with or without adapter name in key).
+    Reads ``pytorch_lora_weights.safetensors`` (or ``.bin``) from ``ckpt_path``. Keys may carry a
+    ``transformer.`` or ``base_model.model.`` prefix and an adapter name
+    (``<module>.lora_A.<adapter>.weight``). Raises ``RuntimeError`` on any shape mismatch or when
+    no key matches.
     """
     ckpt_dir = Path(ckpt_path)
     sf_file = ckpt_dir / "pytorch_lora_weights.safetensors"
@@ -259,7 +287,6 @@ def load_analora_from_peft_checkpoint(model, ckpt_path, device="cpu"):
             "Expected 'pytorch_lora_weights.safetensors' or '.bin'."
         )
 
-    # Build a lookup: module_path → AnaLoRALinear
     analora_map = {}
     for name, module in model.named_modules():
         if isinstance(module, AnaLoRALinear):
@@ -269,12 +296,11 @@ def load_analora_from_peft_checkpoint(model, ckpt_path, device="cpu"):
 
     for key, weight in raw_sd.items():
         norm = key
-        # Strip common prefixes
         for pfx in ("transformer.", "base_model.model."):
             if norm.startswith(pfx):
                 norm = norm[len(pfx):]
 
-        # Strip adapter name: "lora_A.{adapter_name}.weight" → "lora_A.weight"
+        # "<module>.lora_A.<adapter>.weight" -> "<module>.lora_A.weight"
         norm = re.sub(r'\.lora_([AB])\.[\w\-]+\.weight$', r'.lora_\1.weight', norm)
 
         if ".lora_A.weight" in norm:
@@ -304,8 +330,8 @@ def load_analora_from_peft_checkpoint(model, ckpt_path, device="cpu"):
         f"[AnaLoRA Load] matched={len(matched)}, "
         f"skipped={len(skipped)}, shape_mismatch={len(mismatched)}"
     )
-    # Fail loudly: a partial load (e.g. lora_rank in the config differs from the
-    # checkpoint's rank) would otherwise leave the AnaLoRA zero-initialised.
+    # Fail loudly: a partial load (e.g. a lora_rank that differs from the checkpoint's)
+    # would otherwise leave AnaLoRA silently zero-initialized.
     if mismatched:
         raise RuntimeError(
             f"{len(mismatched)} AnaLoRA weights have the wrong shape in {ckpt_path} "
@@ -323,7 +349,7 @@ def load_analora_from_peft_checkpoint(model, ckpt_path, device="cpu"):
 
 
 def find_latest_checkpoint(output_dir):
-    """Path of the highest-step ``checkpoint-<N>`` dir in ``output_dir``, or None."""
+    """Return the highest-step ``checkpoint-<N>`` directory in ``output_dir``, or ``None``."""
     if not os.path.isdir(output_dir):
         return None
     dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint")]

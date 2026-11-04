@@ -5,7 +5,7 @@ AnaLoRA (Stage 1, full-transfer analogy) trainer on Qwen-Image-2.1.
 
 Same recipe as train_analora_flux2_klein.py — a PEFT LoRA learning
 (A, A', B) -> B' from the analogy prompt, prompt dropped 15 % of the time —
-with the Qwen-Image-2.1 conditioning and sampler from train_exlora_qwen21.py.
+with the Qwen-Image-2.1 conditioning and sampler from sia/backbones/qwen_image21.py.
 Only the concat formulation is supported (Qwen-Image-2.1 takes the three
 images as separate condition images natively).
 
@@ -30,20 +30,18 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from training.train_exlora_qwen21 import (  # noqa: E402  (sets offline env vars first)
-    _USE_WANDB,
+from training.train_exlora_qwen21 import _USE_WANDB, parse_args, render_rows  # noqa: E402
+from training.train_analora_flux2_klein import ANALORA_ADAPTER_NAME  # noqa: E402
+from sia.backbones.qwen_image21 import (  # noqa: E402
     ANALORA_TARGET_MODULES,
     backward_per_sample,
     encode_prompt,
     generate_qwen21,
     harmonize_images_qwen21,
     load_pipeline_qwen21,
-    parse_args,
     prepare_conditions,
-    render_rows,
     sample_flow_loss,
 )
-from training.train_analora_flux2_klein import ANALORA_ADAPTER_NAME  # noqa: E402
 from sia.data import DATASET, AnalogyPairDataset, collate_pairs  # noqa: E402
 
 if _USE_WANDB:

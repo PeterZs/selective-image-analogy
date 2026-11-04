@@ -47,7 +47,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 from diffusers import Flux2KleinPipeline
 
-from sia.klein_tokens import klein_find_substring_token_indices
+from sia.backbones.flux2_klein import klein_find_substring_token_indices
 
 # Bump this whenever the vector-building logic changes materially (fallback
 # pair diversity, pooling, DoM formula, …).  Cached vectors whose version

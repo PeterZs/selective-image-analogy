@@ -97,7 +97,8 @@ CSV_CACHE = "steering_cache_qwen21"
 def cmd_csvbuild(args):
     """Build (and cache) one CSV direction per distinct benchmark edit text,
     from ``--pairs`` Qwen-generated contrastive prompt pairs each (paper: 64)."""
-    from training.train_exlora_qwen21 import QwenImage21Pipeline
+    import training.train_exlora_flux2_klein  # noqa: F401  (accelerate compatibility shim)
+    from diffusers import QwenImage21Pipeline
     from training.steering_dom_qwen21 import get_or_build_steering_vector_qwen21
     from omegaconf import OmegaConf
     import torch
@@ -131,16 +132,6 @@ def cmd_csvbuild(args):
 def cmd_generate(args):
     from omegaconf import OmegaConf
 
-    from training.train_exlora_qwen21 import (
-        ANALORA_TARGET_MODULES,
-        EXLORA_TARGET_MODULES,
-        build_analogy_prompt,
-        encode_prompt,
-        generate_qwen21,
-        harmonize_images_qwen21,
-        load_pipeline_qwen21,
-        prepare_conditions,
-    )
     import torch
     from training.infer_single import apply_csv
     from training.steering_dom_qwen21 import get_or_build_steering_vector_qwen21
@@ -153,7 +144,18 @@ def cmd_generate(args):
         load_exlora_state_dict,
     )
     from sia.hf import resolve_checkpoint
-    from sia.utils.qwen21 import qwen21_find_substring_token_indices, qwen21_text_token_mask
+    from sia.backbones.qwen_image21 import (
+        ANALORA_TARGET_MODULES,
+        EXLORA_TARGET_MODULES,
+        encode_prompt,
+        generate_qwen21,
+        harmonize_images_qwen21,
+        load_pipeline_qwen21,
+        prepare_conditions,
+        qwen21_find_substring_token_indices,
+        qwen21_text_token_mask,
+    )
+    from sia.prompt import build_analogy_prompt
 
     cfg = OmegaConf.load(args.config)
     device = torch.device("cuda")

@@ -41,52 +41,19 @@ import numpy as np
 import argparse
 
 from sia.data import DATASET, AnalogyPairDataset, collate_pairs
-# Importing the ExLoRA trainer also applies its accelerate compatibility shim.
-from training.train_exlora_flux2_klein import (
+from sia.backbones.flux2_klein import (
+    _native_wh,
     compute_empirical_mu,
     compute_text_embeddings,
-    _native_wh,
     encode_single_image,
     get_sigmas,
     load_models,
+    prepare_analora_latents as prepare_analogy_latents,
 )
+# Imported for its side effect: the accelerate compatibility patch must be active before models load.
+import training.train_exlora_flux2_klein  # noqa: E402,F401
 
 ANALORA_ADAPTER_NAME = "visual-analogy-analora"
-
-
-@torch.no_grad()
-def prepare_analogy_latents(pipe, batch):
-    """Encode A, A', B, B' through VAE and prepare latents + IDs.
-
-    Returns:
-        target_latents, condition_latents, target_ids, condition_ids
-    """
-    target_arr, cond_arr = [], []
-
-    for a, a_prime, b, b_prime in zip(batch['A'], batch['A_prime'], batch['B'], batch['B_prime']):
-        lat_a = encode_single_image(pipe, a)
-        lat_a_prime = encode_single_image(pipe, a_prime)
-        lat_b = encode_single_image(pipe, b)
-        lat_b_prime = encode_single_image(pipe, b_prime)
-
-        # B' is target, A/A'/B are separate conditions
-        target_arr.append(Flux2KleinPipeline._pack_latents(lat_b_prime))
-        cond_a = Flux2KleinPipeline._pack_latents(lat_a).squeeze(0)
-        cond_ap = Flux2KleinPipeline._pack_latents(lat_a_prime).squeeze(0)
-        cond_b = Flux2KleinPipeline._pack_latents(lat_b).squeeze(0)
-        cond_arr.append(
-            torch.cat([cond_a, cond_ap, cond_b], dim=0).unsqueeze(0))
-
-    target_ids = Flux2KleinPipeline._prepare_latent_ids(lat_b_prime)
-    condition_ids = Flux2KleinPipeline._prepare_image_ids(
-        [lat_a, lat_a_prime, lat_b])
-
-    return (
-        torch.cat(target_arr, dim=0),
-        torch.cat(cond_arr, dim=0),
-        target_ids,
-        condition_ids,
-    )
 
 
 def add_lora(transformer, args, lora_target_modules):

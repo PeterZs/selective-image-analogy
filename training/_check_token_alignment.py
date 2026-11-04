@@ -39,14 +39,14 @@ if str(_REPO_ROOT) not in sys.path:
 import torch  # noqa: E402
 from transformers import Qwen2TokenizerFast  # noqa: E402
 
-from sia.klein_tokens import (  # noqa: E402
+from sia.backbones.flux2_klein import (  # noqa: E402
     _apply_klein_chat_template,
+    build_token_mask,
     klein_find_substring_token_indices,
     klein_templated_prompt_token_positions,
+    templated_substring_indices,
 )
 from sia.prompt import build_analogy_prompt  # noqa: E402
-from training.train_exlora_flux2_klein import build_token_mask  # noqa: E402
-from training.infer_single import templated_substring_indices  # noqa: E402
 
 
 MAX_LEN = 512

@@ -24,13 +24,13 @@ env/
 Thumbs.db
 
 # Training outputs
-experiments/
+/experiments
 wandb/
 *.pt
 *.safetensors
 
 # Data (downloaded via setup.sh)
-data/
+/data
 
 # Environment / secrets
 .env

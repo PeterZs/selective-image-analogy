@@ -1,7 +1,7 @@
-"""Hugging Face Hub access for SIA weights.
+"""Resolution of SIA adapter checkpoints from a local directory or the Hugging Face Hub.
 
-Models and datasets are loaded with the standard ``from_pretrained`` / ``load_dataset`` calls, which use the
-HF cache. Set ``HF_HUB_OFFLINE=1`` to run from the cache only.
+Base models and datasets are loaded with the standard ``from_pretrained`` / ``load_dataset``
+calls, which use the HF cache. Set ``HF_HUB_OFFLINE=1`` to run from the cache only.
 """
 from pathlib import Path
 
@@ -10,11 +10,20 @@ from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 
 
 def resolve_checkpoint(spec, revision=None) -> Path:
-    """Directory of an adapter checkpoint given as a local dir or as a Hub path.
+    """Return the local directory of an adapter checkpoint.
 
-    An existing local directory wins. Otherwise ``spec`` is read as ``<org>/<repo>/<subfolder>[@revision]``
-    (e.g. ``selective-image-analogy/SIA-weights/qwen_image21/exlora``): only that subfolder is downloaded
-    into the HF cache and its local path is returned. ``revision`` applies when ``spec`` names none.
+    Args:
+        spec: an existing local directory, or a Hub path ``<org>/<repo>/<subfolder>[@revision]``,
+            e.g. ``selective-image-analogy/SIA-weights/qwen_image21/exlora@main``. A local
+            directory takes precedence. For a Hub path only ``<subfolder>`` is downloaded into
+            the HF cache.
+        revision: Hub revision (branch, tag or commit) used when ``spec`` names none.
+
+    Returns:
+        Path to the checkpoint directory (inside the HF cache for a Hub path).
+
+    Raises:
+        FileNotFoundError: ``spec`` is neither a local directory nor a downloadable Hub folder.
     """
     if Path(spec).is_dir():
         return Path(spec)
