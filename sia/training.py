@@ -4,11 +4,8 @@ Config loading, the accelerator / Weights & Biases setup, the accelerate checkpo
 adapter types, resuming, the AnaLoRA L2 anchor of Stage 2 and the hand-off between a trainer's
 backbone-specific setup and its training loop (``TrainingRun``). Nothing here depends on a
 backbone: model classes are passed in by the caller.
-
-Importing this module also patches ``accelerate``'s ``set_module_tensor_to_device`` (see below).
 """
 import argparse
-import inspect as _inspect
 import os
 import pickle
 import re
@@ -43,31 +40,6 @@ USE_WANDB = (
 )
 if USE_WANDB:
     import wandb
-
-# ── Compatibility shim: strip unknown kwargs from set_module_tensor_to_device
-try:
-    from accelerate.utils import modeling as _accelerate_modeling
-    _orig_smttd = _accelerate_modeling.set_module_tensor_to_device
-    _known_smttd_params = set(_inspect.signature(_orig_smttd).parameters)
-    _VAR_KEYWORD = _inspect.Parameter.VAR_KEYWORD
-    _has_var_kw = any(
-        p.kind == _VAR_KEYWORD
-        for p in _inspect.signature(_orig_smttd).parameters.values()
-    )
-    if not _has_var_kw:
-        def _smttd_compat(*args, **kwargs):
-            filtered = {k: v for k, v in kwargs.items()
-                        if k in _known_smttd_params}
-            return _orig_smttd(*args, **filtered)
-        _accelerate_modeling.set_module_tensor_to_device = _smttd_compat
-        try:
-            import diffusers.models.model_loading_utils as _dml
-            _dml.set_module_tensor_to_device = _smttd_compat
-        except Exception:
-            pass
-except Exception:
-    pass
-# ───────────────────────────────────────────────────────────────────────────
 
 
 # ---------------------------------------------------------------------------

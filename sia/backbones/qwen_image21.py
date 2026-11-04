@@ -24,7 +24,7 @@ token mask shared by ExLoRA and the CSV:
 
 Every position helper mirrors ``QwenImage21Pipeline._get_qwen_prompt_embeds``
 and is checked against the processor's own ``input_ids`` by
-``training/_check_token_alignment_qwen21.py``.
+``tests/test_token_alignment.py``.
 
 This module needs the Qwen environment; Klein code must never import it at
 module level.

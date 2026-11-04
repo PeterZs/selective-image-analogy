@@ -16,7 +16,7 @@ dataset: "selective-image-analogy/SIA-Multi-Edit-Analogy"
 dataset_revision: null
 
 # Training (and inference) image resolution — must be a multiple of 16.
-# Keep in sync with infer_single.py --cell_size.
+# Inference encodes the images at sia.backbones.flux2_klein.TRAIN_SIZE, which must equal this value.
 resolution: 512
 
 seed: 0

@@ -8,8 +8,13 @@ inference
     imports the shared layer only;
 training
     imports the shared layer, inference and backbones (no ``sia.eval``);
+eval (``sia/eval/``)
+    imports the shared layer and inference (no ``sia.training``);
 nothing under ``sia/``
-    imports the ``training`` or ``scripts`` folders.
+    imports the ``training`` or ``scripts`` folders;
+scripts
+    import first-party code only from ``sia`` (never another script), and only
+    ``scripts/train_*.py`` import ``sia.training``.
 
 Modules that do not exist yet are skipped.
 """
@@ -19,6 +24,7 @@ from pathlib import Path
 import pytest
 
 SIA = Path(__file__).resolve().parent.parent / "sia"
+SCRIPTS = SIA.parent / "scripts"
 
 SHARED = ["hf.py", "lora.py", "adapters.py", "prompt.py", "data.py", "concept_suppression.py", "viz.py"]
 BACKBONES = ["flux2_klein.py", "qwen_image21.py"]
@@ -97,3 +103,30 @@ def test_training_imports_no_evaluation_code():
 @pytest.mark.parametrize("path", sorted(SIA.rglob("*.py")), ids=lambda p: str(p.relative_to(SIA.parent)))
 def test_package_does_not_import_training_or_scripts(path):
     assert forbidden_imports(path, OUTSIDE_PACKAGE) == []
+
+
+@pytest.mark.parametrize("path", sorted((SIA / "eval").glob("*.py")), ids=lambda p: p.name)
+def test_eval_imports_no_training_code(path):
+    assert forbidden_imports(path, ["sia.training"] + OUTSIDE_PACKAGE) == []
+
+
+def script_imports(path):
+    """Top-level module names imported by a script (it is not part of a package)."""
+    names = set()
+    for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0, f"relative import in {path.name}"
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return names
+
+
+@pytest.mark.parametrize("path", sorted(SCRIPTS.glob("*.py")), ids=lambda p: p.name)
+def test_scripts_import_only_sia(path):
+    first_party = OUTSIDE_PACKAGE + [p.stem for p in SCRIPTS.glob("*.py")]
+    names = script_imports(path)
+    assert sorted(n for n in names if any(n == p or n.startswith(p + ".") for p in first_party)) == []
+    if not path.name.startswith("train_"):
+        assert sorted(n for n in names if n == "sia.training" or n.startswith("sia.training.")) == []

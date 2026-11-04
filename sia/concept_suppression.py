@@ -318,6 +318,38 @@ def get_or_build_steering_vector(
     return v_unit.to(device=device, dtype=torch.float32), meta
 
 
+def build_steering_vector_from_pairs(backbone, edit: str, pairs_path, pipe, device,
+                                     cache_dir) -> Tuple[torch.Tensor, dict]:
+    """Build and cache the CSV direction of ``edit`` from existing contrast pairs.
+
+    ``pairs_path`` is a ``pairs.jsonl`` of another cache (typically the Qwen-Image-2.1 one); its
+    sentences are pooled with ``backbone``'s own encoder. Two backbones then share the same
+    (unseeded) pairs, so their directions differ only by the encoder. The result is written to
+    ``<cache_dir>/<backbone.cache_key(edit)>/`` like any cached direction, so later runs read it
+    through ``get_or_build_steering_vector``. Returns ``(v_unit, meta)``.
+    """
+    records = _read_jsonl(Path(pairs_path))
+    v_unit, stats = compute_dom_vector(backbone, records, pipe, device)
+    edit_dir = Path(cache_dir).expanduser() / backbone.cache_key(edit)
+    edit_dir.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(edit_dir / "pairs.jsonl", records)
+    torch.save(v_unit.detach().cpu().float(), edit_dir / "vector.pt")
+    meta = {"edit": edit, "method": "reused_pairs", "cache_version": _CACHE_VERSION,
+            "pairs_from": str(pairs_path), "n_records_saved": len(records), "n_usable_after_pooling": stats["n_usable"],
+            "pre_normalization_norm": stats["pre_norm"], "source": "built"}
+    (edit_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    return v_unit, meta
+
+
+def reusable_pairs(cache_dir) -> dict:
+    """``{edit text: pairs.jsonl path}`` for every direction in ``cache_dir`` that kept its pairs."""
+    pairs = {}
+    for meta_path in sorted(Path(cache_dir).expanduser().glob("*/meta.json")):
+        if (meta_path.parent / "pairs.jsonl").exists():
+            pairs[json.loads(meta_path.read_text())["edit"]] = meta_path.parent / "pairs.jsonl"
+    return pairs
+
+
 # ---------------------------------------------------------------------------
 # Applying the direction to prompt embeddings
 # ---------------------------------------------------------------------------

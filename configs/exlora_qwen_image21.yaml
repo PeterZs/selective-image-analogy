@@ -17,7 +17,7 @@ dataset_revision: null
 
 # Target area is resolution^2 at each image's own aspect ratio, sides
 # multiples of 32 (QwenImage21Pipeline rule). Use the same value at inference
-# (infer_single_qwen21.py --resolution).
+# (scripts/infer.py --resolution).
 resolution: 512
 
 seed: 0
