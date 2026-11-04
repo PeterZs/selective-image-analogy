@@ -47,7 +47,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 from diffusers import Flux2KleinPipeline
 
-from visual_analogy.utils.selective_lora import klein_find_substring_token_indices
+from sia.klein_tokens import klein_find_substring_token_indices
 
 # Bump this whenever the vector-building logic changes materially (fallback
 # pair diversity, pooling, DoM formula, …).  Cached vectors whose version
@@ -273,7 +273,6 @@ def _templated_substring_indices(
         return klein_find_substring_token_indices(
             prompt, substr, tokenizer,
             max_length=max_length,
-            use_chat_template=True,
         )
     except AssertionError:
         pass

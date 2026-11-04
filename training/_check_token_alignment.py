@@ -19,8 +19,6 @@ Coverage:
       * positions are a subset of the templated-prompt positions,
       * ExLoRA's ``build_token_mask`` and the steering-vector
         ``templated_substring_indices`` agree on the position set.
-  - Templated vs. raw alignment differ (canary against the pre-fix
-    silent-empty-mask bug).
   - ``build_token_mask`` raises (not silently zeroes) on missing edits.
 
 Usage:
@@ -31,7 +29,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -39,23 +36,16 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
 import torch  # noqa: E402
 from transformers import Qwen2TokenizerFast  # noqa: E402
 
-from visual_analogy.utils.hf_utils import resolve_hf_snapshot_path  # noqa: E402
-from visual_analogy.utils.selective_lora import (  # noqa: E402
+from sia.klein_tokens import (  # noqa: E402
     _apply_klein_chat_template,
     klein_find_substring_token_indices,
     klein_templated_prompt_token_positions,
 )
-from training.train_exlora_flux2_klein import (  # noqa: E402
-    build_analogy_prompt,
-    build_token_mask,
-)
+from sia.prompt import build_analogy_prompt  # noqa: E402
+from training.train_exlora_flux2_klein import build_token_mask  # noqa: E402
 from training.infer_single import templated_substring_indices  # noqa: E402
 
 
@@ -116,7 +106,7 @@ def _run_checks_for_n(n: int, edits: list[str], tokenizer) -> bool:
     # 1. Each edit aligns and decodes back to itself
     for i, edit in enumerate(edits):
         positions = klein_find_substring_token_indices(
-            prompt, edit, tokenizer, max_length=MAX_LEN, use_chat_template=True)
+            prompt, edit, tokenizer, max_length=MAX_LEN)
         decoded = tokenizer.decode([ids[p] for p in positions],
                                    skip_special_tokens=False)
         ok = decoded.strip() == edit.strip()
@@ -131,7 +121,7 @@ def _run_checks_for_n(n: int, edits: list[str], tokenizer) -> bool:
         prompt, tokenizer, max_length=MAX_LEN))
     for i, edit in enumerate(edits):
         edit_positions = set(klein_find_substring_token_indices(
-            prompt, edit, tokenizer, max_length=MAX_LEN, use_chat_template=True))
+            prompt, edit, tokenizer, max_length=MAX_LEN))
         all_ok &= _check(
             edit_positions.issubset(all_positions),
             f"  edit {i+1} positions are a subset of templated-prompt positions"
@@ -144,7 +134,7 @@ def _run_checks_for_n(n: int, edits: list[str], tokenizer) -> bool:
     for i, edit in enumerate(edits):
         exlora_mask = build_token_mask(
             prompt, [edit], tokenizer, device=torch.device("cpu"),
-            max_seq_len=MAX_LEN, use_chat_template=True,
+            max_seq_len=MAX_LEN,
         )
         exlora_positions = set(torch.nonzero(exlora_mask[0]).flatten().tolist())
         csv_positions = set(templated_substring_indices(
@@ -158,11 +148,11 @@ def _run_checks_for_n(n: int, edits: list[str], tokenizer) -> bool:
     # 4. build_token_mask with the full edit list covers >= sum-of-per-edit
     full_mask = build_token_mask(
         prompt, edits, tokenizer, device=torch.device("cpu"),
-        max_seq_len=MAX_LEN, use_chat_template=True,
+        max_seq_len=MAX_LEN,
     )
     n_true = int(full_mask.sum().item())
     expected_min = sum(len(klein_find_substring_token_indices(
-        prompt, e, tokenizer, max_length=MAX_LEN, use_chat_template=True))
+        prompt, e, tokenizer, max_length=MAX_LEN))
         for e in edits)
     all_ok &= _check(
         n_true == expected_min,
@@ -179,29 +169,16 @@ def main():
                         default="black-forest-labs/FLUX.2-klein-base-9B")
     args = parser.parse_args()
 
-    local_path = resolve_hf_snapshot_path(args.pretrained)
-    tokenizer = Qwen2TokenizerFast.from_pretrained(
-        local_path, subfolder="tokenizer", local_files_only=True)
+    tokenizer = Qwen2TokenizerFast.from_pretrained(args.pretrained, subfolder="tokenizer")
 
     all_ok = True
     for n in sorted(EDITS_BY_N):
         all_ok &= _run_checks_for_n(n, EDITS_BY_N[n], tokenizer)
 
     print()
-    print("=== Regression canaries (run once, N=2) ===")
+    print("=== Regression canary (run once, N=2) ===")
     edits = EDITS_BY_N[2]
     prompt = build_analogy_prompt(edits, edits)
-
-    # Templated alignment differs from raw alignment
-    raw_positions = klein_find_substring_token_indices(
-        prompt, edits[0], tokenizer, max_length=MAX_LEN, use_chat_template=False)
-    tmpl_positions = klein_find_substring_token_indices(
-        prompt, edits[0], tokenizer, max_length=MAX_LEN, use_chat_template=True)
-    all_ok &= _check(
-        raw_positions != tmpl_positions,
-        f"raw vs templated positions differ (chat template adds a prefix) — "
-        f"raw={raw_positions[:3]}..  tmpl={tmpl_positions[:3]}.."
-    )
 
     # build_token_mask raises (not silently zeroes) when an edit is missing
     bogus_edit = "this exact phrase definitely is not in the prompt 12345"
@@ -209,7 +186,7 @@ def main():
     try:
         build_token_mask(
             prompt, [bogus_edit], tokenizer, device=torch.device("cpu"),
-            max_seq_len=MAX_LEN, use_chat_template=True,
+            max_seq_len=MAX_LEN,
         )
     except RuntimeError:
         raised = True

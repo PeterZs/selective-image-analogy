@@ -1,4 +1,4 @@
-name: visual_analogy
+name: sia
 channels:
   - pytorch
   - nvidia

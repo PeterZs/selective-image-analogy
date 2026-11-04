@@ -1,0 +1,48 @@
+tracker_name: visual-analogy
+wandb_run_name: "analora_qwen21_analogy"
+
+output_dir: "experiments/analora_qwen21"
+
+pretrained_model_name_or_path: "Qwen/Qwen-Image-2.1"
+
+# Training data: Hugging Face dataset id and optional revision (branch, tag or commit).
+dataset: "selective-image-analogy/SIA-Multi-Edit-Analogy"
+dataset_revision: null
+
+# Condition/target images are resized like QwenImage21Pipeline does: this
+# value squared is the target area, aspect ratio is kept, sides are multiples
+# of 32. The pipeline's own default is 1024; the SIA images are 384x512, so
+# 512 (-> 448x592) avoids training on 2.3x-upsampled targets.
+resolution: 512
+
+seed: 0
+checkpointing_steps: 500
+validation_steps: 100
+
+# QwenImage21Pipeline default: 40 steps, no CFG, prefix KV cache on.
+num_val_inference_steps: 40
+use_kv_cache: true
+
+lora_rank: 16
+lora_dropout: 0.0
+
+resume_from_checkpoint: true
+max_train_steps: 15000
+
+lr_warmup_steps: 0
+learning_rate: 5e-5
+# Samples are run through the transformer one at a time (see train_exlora_qwen21.py)
+# and averaged, so this is the effective batch per optimizer step.
+train_batch_size: 16
+gradient_accumulation_steps: 1
+max_grad_norm: 1
+
+# One sample per transformer pass already saturates the GPU at 512 (batching
+# does not raise throughput), so spare VRAM is better spent here: off is ~26 %
+# faster and peaks at ~68 GiB. Turn it on for resolution 1024 or GPUs < 80 GB.
+gradient_checkpointing: false
+
+# Training sigmas: "none" (uniform), "logit_normal" or "mode", then — with
+# shift_train_sigmas — the sampler's resolution-dependent exponential shift.
+weighting_scheme: "none"
+shift_train_sigmas: true

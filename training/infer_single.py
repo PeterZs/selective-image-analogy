@@ -37,40 +37,36 @@ if str(_REPO_ROOT) not in sys.path:
 
 import numpy as np
 import torch
-from contextlib import contextmanager
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw, ImageFont
 
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
+from diffusers import Flux2KleinPipeline
+from diffusers.pipelines.flux2.pipeline_flux2_klein import retrieve_timesteps
 
-from diffusers import Flux2KleinPipeline, FlowMatchEulerDiscreteScheduler
-from diffusers.models import AutoencoderKLFlux2, Flux2Transformer2DModel
-from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
-
-from visual_analogy.models.selective_lora import ExLoRALinear, AnaLoRALinear
-from visual_analogy.utils import (
-    resolve_hf_snapshot_path,
-    load_analora_state_dict,
+from sia.adapters import (
+    checkpoint_files,
+    checkpoint_lora_rank,
     exlora_token_mask_ctx,
-)
-from visual_analogy.utils.selective_lora import (
+    find_latest_checkpoint,
     inject_analora_modules,
     inject_exlora_modules,
-    klein_find_substring_token_indices,
-    klein_templated_prompt_token_positions,
     load_analora_from_peft_checkpoint,
+    load_analora_state_dict,
+    load_exlora_state_dict,
+    load_tensors,
+    lora_mode_ctx,
 )
+from sia.hf import resolve_checkpoint
+from sia.klein_tokens import klein_find_substring_token_indices, klein_templated_prompt_token_positions
+from sia.prompt import build_analogy_prompt
 from training.train_exlora_flux2_klein import (
     ANALORA_TARGET_MODULES,
     EXLORA_TARGET_MODULES,
-    build_analogy_prompt,
     build_token_mask,
     compute_empirical_mu,
     compute_text_embeddings,
     encode_single_image,
-    retrieve_timesteps,
+    load_models,
 )
 from training.steering_dom import get_or_build_steering_vector
 
@@ -125,51 +121,27 @@ def _cell_dims(ref_img: Image.Image, cell_size: int) -> tuple:
 # Model loading
 # ---------------------------------------------------------------------------
 
-def _find_latest_checkpoint(output_dir):
-    if not os.path.isdir(output_dir):
-        return None
-    dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint")]
-    if not dirs:
-        return None
-    dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-    return os.path.join(output_dir, dirs[-1])
-
-
 def load_pipeline(args, device):
-    local_path = resolve_hf_snapshot_path(args.pretrained_model_name_or_path)
-    tokenizer    = Qwen2TokenizerFast.from_pretrained(local_path, subfolder="tokenizer",    local_files_only=True)
-    # Load straight in bf16 (the pipeline is cast to bf16 below anyway); an fp32
-    # load needs ~70 GB of host RAM for the 9B transformer + 8B text encoder.
-    bf16 = dict(local_files_only=True, torch_dtype=torch.bfloat16)
-    text_encoder = Qwen3ForCausalLM.from_pretrained( local_path, subfolder="text_encoder", **bf16)
-    vae          = AutoencoderKLFlux2.from_pretrained(local_path, subfolder="vae",          **bf16)
-    transformer  = Flux2Transformer2DModel.from_pretrained(local_path, subfolder="transformer", **bf16)
-    scheduler    = FlowMatchEulerDiscreteScheduler.from_pretrained(local_path, subfolder="scheduler", local_files_only=True)
+    """Klein pipeline with AnaLoRA + ExLoRA loaded.
+
+    Weights come from ``args.checkpoint_dir`` (local dir or Hub path, see ``sia.hf.resolve_checkpoint``)
+    or else the latest checkpoint in ``args.output_dir``. A Stage-2 checkpoint carries its own AnaLoRA;
+    only without one is the Stage-1 AnaLoRA read from ``args.analora_path``.
+    """
+    tokenizer, text_encoder, vae, transformer, scheduler = load_models(args)
 
     explicit_ckpt = getattr(args, "checkpoint_dir", None)
     if explicit_ckpt:
-        # Fail loud: a user-supplied path that doesn't exist used to be
-        # silently swallowed (ckpt_dir = None), which left ExLoRA at its
-        # zero-initialised state — ExLoRA had *no effect* and st=0 vs st=1
-        # produced visually identical outputs. Now we raise so typos /
-        # wrong experiment names are caught immediately.
-        if not os.path.isdir(explicit_ckpt):
-            raise FileNotFoundError(
-                f"--checkpoint_dir not found: {explicit_ckpt}\n"
-                f"  Check that the experiment name and step are correct, e.g.\n"
-                f"  experiments/<exp>/checkpoint-<N>")
-        ckpt_dir = explicit_ckpt
+        # Fail loud: a wrong path must not silently leave ExLoRA zero-initialised.
+        ckpt_dir = resolve_checkpoint(explicit_ckpt)
     else:
-        ckpt_dir = _find_latest_checkpoint(args.output_dir)
+        ckpt_dir = find_latest_checkpoint(args.output_dir)
 
-    # A Stage-2 checkpoint carries its own AnaLoRA, which replaces the Stage-1
-    # weights; only fall back to analora_path when it doesn't. Take the rank
-    # from the weights so a config/checkpoint rank mismatch can't break loading.
-    bl_path = os.path.join(ckpt_dir, "base_lora.pt") if ckpt_dir else None
-    has_ckpt_base = bl_path is not None and os.path.exists(bl_path)
+    # Take the rank from the weights so a config/checkpoint rank mismatch can't break loading.
+    analora_file, exlora_file = checkpoint_files(ckpt_dir) if ckpt_dir else (None, None)
+    has_ckpt_base = analora_file is not None and analora_file.exists()
     if has_ckpt_base:
-        bl_state = torch.load(bl_path, map_location="cpu", weights_only=True)
-        rank = next(w.shape[0] for k, w in bl_state.items() if k.endswith("lora_A.weight"))
+        rank = checkpoint_lora_rank(ckpt_dir, load_tensors(analora_file))
         if rank != args.lora_rank:
             print(f"[Checkpoint] lora_rank {args.lora_rank} in config -> {rank} from checkpoint")
             args.lora_rank = rank
@@ -178,7 +150,7 @@ def load_pipeline(args, device):
                                       r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
     print(f"[AnaLoRA] Injected {len(n_base)} modules")
     if not has_ckpt_base:
-        load_analora_from_peft_checkpoint(transformer, args.analora_path, device="cpu")
+        load_analora_from_peft_checkpoint(transformer, resolve_checkpoint(args.analora_path), device="cpu")
 
     n_st = inject_exlora_modules(transformer, EXLORA_TARGET_MODULES,
                                          r=args.lora_rank, alpha=args.lora_rank, dropout=0.0)
@@ -186,41 +158,17 @@ def load_pipeline(args, device):
 
     if ckpt_dir:
         print(f"[Checkpoint] Loading from {ckpt_dir}")
-        st_path = os.path.join(ckpt_dir, "selective_lora.pt")
-        if os.path.exists(st_path):
-            state = torch.load(st_path, map_location="cpu", weights_only=True)
-            _, unexpected = transformer.load_state_dict(state, strict=False)
-            if unexpected:
-                raise ValueError(f"Unexpected keys: {unexpected}")
-            st_params = {
-                f"{name}.{ab}.weight"
-                for name, m in transformer.named_modules()
-                if isinstance(m, ExLoRALinear)
-                for ab in ("lora_A", "lora_B")
-            }
-            matched = sum(1 for k in state if k in st_params)
-            print(f"[Checkpoint] ExLoRA loaded: {matched}/{len(state)} keys matched "
-                  f"({len(st_params)} ExLoRA params in model)")
-            if matched == 0:
-                raise RuntimeError("No ExLoRA keys matched — check module naming.")
-            for m in transformer.modules():
-                if isinstance(m, ExLoRALinear) and m.lora_B.weight.abs().sum() > 0:
-                    print(f"[Checkpoint] ExLoRA B norm OK: {m.lora_B.weight.norm().item():.4f}")
-                    break
-            else:
-                print("[Checkpoint] WARNING — all ExLoRA lora_B weights are zero")
+        if exlora_file.exists():
+            load_exlora_state_dict(transformer, exlora_file)
         elif explicit_ckpt:
-            # User explicitly pointed at a checkpoint dir but it has no
-            # selective_lora.pt — that almost certainly means the user
-            # picked an AnaLoRA-only run by mistake. Refuse to silently
-            # run with zero-init ExLoRA.
+            # Most likely an AnaLoRA-only run picked by mistake: refuse to run with zero-init ExLoRA.
             raise FileNotFoundError(
-                f"selective_lora.pt missing from {ckpt_dir}\n"
+                f"{exlora_file.name} missing from {ckpt_dir}\n"
                 f"  Files present: {sorted(os.listdir(ckpt_dir))}\n"
                 f"  Without this file ExLoRA is zero-initialised and has "
                 f"no effect (st=0 == st=1).")
         if has_ckpt_base:
-            load_analora_state_dict(transformer, bl_path, "cpu")
+            load_analora_state_dict(transformer, analora_file, "cpu")
             print("[Checkpoint] AnaLoRA loaded from checkpoint")
     else:
         print("[Checkpoint] No checkpoint found — using freshly initialised weights")
@@ -234,30 +182,7 @@ def load_pipeline(args, device):
     return pipe, tokenizer, text_encoder
 
 
-# ---------------------------------------------------------------------------
-# LoRA mode context manager
-# ---------------------------------------------------------------------------
-
 SCALE_VALUES = [0.0, 0.25, 0.5, 0.75, 1.0]  # overridden by --scale_values
-
-
-@contextmanager
-def lora_mode_ctx(transformer, analora_scale: float = 1.0, exlora_scale: float = 1.0):
-    """Scale both LoRAs by the given multipliers (0.0 = off, 1.0 = full strength)."""
-    base_mods = [m for m in transformer.modules() if type(m) is AnaLoRALinear]
-    st_mods   = [m for m in transformer.modules() if isinstance(m, ExLoRALinear)]
-    orig_base = [m.scaling for m in base_mods]
-    for m, s in zip(base_mods, orig_base):
-        m.scaling = analora_scale * s
-    for m in st_mods:
-        m.set_scaling(exlora_scale * m.alpha / m.r)
-    try:
-        yield
-    finally:
-        for m, s in zip(base_mods, orig_base):
-            m.scaling = s
-        for m in st_mods:
-            m.reset_scaling()
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +217,6 @@ def templated_substring_indices(prompt: str, substr: str, tokenizer,
         return klein_find_substring_token_indices(
             prompt, substr, tokenizer,
             max_length=max_length,
-            use_chat_template=True,
         )
     except AssertionError:
         return []
@@ -311,6 +235,7 @@ def apply_csv(
     all_prompt_positions: list = None,
     mode: str = "add",
     max_push_norm_ratio: float = 0.0,
+    ablate_scale: float = 1.0,
 ) -> torch.Tensor:
     """Return a steered copy of ``prompt_embeds`` using the chosen steering
     mode.
@@ -358,6 +283,13 @@ def apply_csv(
     the embedding norm — a common cause of paradoxical concept
     amplification (see degenerate-cache note in ``steering_dom.py``).
     Set to 0 (default) to disable clamping.
+
+    ablate_scale
+    ------------
+    ``lambda`` of the paper's eq. (CSV): ``x' = x - lambda (x · v̂) v̂``. The
+    default 1.0 is the orthogonal projection (pure removal of the component);
+    larger values over-subtract it, which is how the paper's strengths
+    {75, ..., 300} act. Only used in ``mode="ablate"``.
 
     v̂ must be unit-norm (which is what ``steering_dom.compute_dom_vector``
     already produces). ``alpha`` here is the pre-multiplied value
@@ -417,17 +349,11 @@ def apply_csv(
                 push = raw_push
             if mode == "ablate":
                 proj_scalar = torch.dot(x_t, v_hat)
-                x_t = x_t - proj_scalar * v_hat
+                x_t = x_t - ablate_scale * proj_scalar * v_hat
             if push is not None:
                 x_t = x_t + push
             steered[0, t, :] = x_t
     return steered
-
-
-# ``templated_prompt_token_positions`` lives in visual_analogy.utils.selective_lora
-# under the canonical name ``klein_templated_prompt_token_positions``. We
-# re-export it here as the historical name to keep call sites compact.
-templated_prompt_token_positions = klein_templated_prompt_token_positions
 
 
 def parse_embedding_schedule(raw):
@@ -959,7 +885,7 @@ def build_row_grid(image_a, image_a_prime, image_b,
 # Main
 # ---------------------------------------------------------------------------
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",        type=str, required=True)
     parser.add_argument("--image_a",       type=str, required=True)
@@ -1042,12 +968,20 @@ def parse_args():
                              "generation.")
     parser.add_argument("--output",         type=str, default="result.png")
     parser.add_argument("--checkpoint_dir", type=str, default=None,
-                        help="Explicit checkpoint directory to load ExLoRA/AnaLoRA from. "
-                             "Overrides the auto-discovery from output_dir in the config.")
+                        help="Stage-2 checkpoint to load ExLoRA/AnaLoRA from: a local dir or a Hub path "
+                             "<org>/<repo>/<subfolder>[@revision]. Overrides the auto-discovery "
+                             "from output_dir in the config.")
     parser.add_argument("--num_steps", type=int, default=28)
     parser.add_argument("--cell_size", type=int, default=512)
     parser.add_argument("--seed",      type=int, default=0)
-    cli = parser.parse_args()
+    return parser
+
+
+def parse_args(cli=None):
+    """Build the run config from ``cli`` (parsed ``build_parser()`` args;
+    parsed from sys.argv when omitted) merged into the YAML config."""
+    if cli is None:
+        cli = build_parser().parse_args()
 
     cfg = OmegaConf.load(cli.config)
     cfg.num_steps  = cli.num_steps
@@ -1281,7 +1215,7 @@ def main():
     scopes = list(args.csv_scopes)
     all_prompt_positions = None
     if "prompt" in scopes:
-        all_prompt_positions = templated_prompt_token_positions(
+        all_prompt_positions = klein_templated_prompt_token_positions(
             args.prompt, tokenizer, max_length=max_seq_len)
         print(f"[Steering] scope='prompt' will add the vector at "
               f"{len(all_prompt_positions)} non-padding token positions "

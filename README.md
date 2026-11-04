@@ -9,7 +9,7 @@
 <sup>1</sup>Simon Fraser University &nbsp; <sup>2</sup>University of Cyprus &nbsp; <sup>3</sup>Shahid Beheshti University &nbsp; <sup>4</sup>CYENS Centre of Excellence<br><sup>*</sup>Equal contribution
 
 <!-- TODO: link the arXiv badge once the paper is on arXiv -->
-[![Project Page](https://img.shields.io/badge/Project-Page-2ea44f)](https://selective-image-analogy.github.io/) [![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b)](#) [![Video](https://img.shields.io/badge/Video-YouTube-red?logo=youtube)](https://www.youtube.com/watch?v=HU010YnVEwI) [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-Multi--Edit%20Analogy-yellow)](https://huggingface.co/datasets/Amirhossein-Alimohammadi/SIA-Multi-Edit-Analogy)
+[![Project Page](https://img.shields.io/badge/Project-Page-2ea44f)](https://selective-image-analogy.github.io/) [![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b)](#) [![Video](https://img.shields.io/badge/Video-YouTube-red?logo=youtube)](https://www.youtube.com/watch?v=HU010YnVEwI) [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-Multi--Edit%20Analogy-yellow)](https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy)
 
 <img src="https://selective-image-analogy.github.io/static/figures/teaser.svg" alt="SIA teaser: one demonstration pair with three edits; SIA transfers any chosen subset of them to a new image" width="100%">
 
@@ -45,7 +45,7 @@ conda activate visual_analogy
 pip install -e .
 ```
 
-Or install and download the training data into `./data` in one step:
+Or install in one step:
 
 ```bash
 bash setup.sh
@@ -53,7 +53,7 @@ bash setup.sh
 
 ### Download the base model
 
-The scripts load models from the local HuggingFace cache and run in offline mode by default, so download FLUX.2-Klein once before training or inference:
+Models are loaded with the standard `from_pretrained` calls and are downloaded to the Hugging Face cache on first use. To fetch FLUX.2-Klein ahead of time (afterwards `export HF_HUB_OFFLINE=1` runs everything from the cache):
 
 ```bash
 export HF_TOKEN="your_huggingface_token"
@@ -68,7 +68,7 @@ All commands below are run from the repository root.
 
 ## Dataset
 
-The **Multi-Edit Analogy Dataset** from the paper is on the Hugging Face Hub: [`Amirhossein-Alimohammadi/SIA-Multi-Edit-Analogy`](https://huggingface.co/datasets/Amirhossein-Alimohammadi/SIA-Multi-Edit-Analogy).
+The **Multi-Edit Analogy Dataset** from the paper is on the Hugging Face Hub: [`selective-image-analogy/SIA-Multi-Edit-Analogy`](https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy).
 
 | Subset | Split | Rows | Contents |
 | --- | --- | ---: | --- |
@@ -79,43 +79,28 @@ The **Multi-Edit Analogy Dataset** from the paper is on the Hugging Face Hub: [`
 ```python
 from datasets import load_dataset
 
-train = load_dataset("Amirhossein-Alimohammadi/SIA-Multi-Edit-Analogy", "subjects", split="train")
-bench = load_dataset("Amirhossein-Alimohammadi/SIA-Multi-Edit-Analogy", "analogy_benchmark", split="test")
+train = load_dataset("selective-image-analogy/SIA-Multi-Edit-Analogy", "subjects", split="train")
+bench = load_dataset("selective-image-analogy/SIA-Multi-Edit-Analogy", "analogy_benchmark", split="test")
 ```
 
-Each row records the number of edits, the subject type (creature or non-creature) and the type of every edit, so subsets are one `filter` away. See the [dataset card](https://huggingface.co/datasets/Amirhossein-Alimohammadi/SIA-Multi-Edit-Analogy) for all columns.
+Each row records the number of edits, the subject type (creature or non-creature) and the type of every edit, so subsets are one `filter` away. See the [dataset card](https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy) for all columns.
 
-The training scripts read the folder layout below, which `setup.sh` downloads.
+The training scripts load the `subjects` split directly with `datasets.load_dataset` (config keys `dataset` and optional `dataset_revision`); it is downloaded to the Hugging Face cache on first use.
 
-## Data Structure
-
-Training data lives in `data/` (set by `data_root` in the configs):
-
-```
-data/
-└── <edit_category>/              # e.g. 2edits, 3edits_non_creature, 4edits
-    └── <setting>/                # setting1, setting2, …
-        └── <data_item>/          # data1, data2, …
-            ├── input.png         # source image (A or B)
-            ├── combined1.png     # edit 1 applied
-            ├── combined12.png    # edits 1 + 2 applied
-            ├── combined123.png   # edits 1 + 2 + 3 applied
-            └── prompt.json       # {"edit1": "...", "edit2": "...", ...}
-```
-
-Two items from the same setting form an analogy pair: one gives A / A', the other B / B', using the same set of applied edits. The edit prompt is built from `prompt.json`.
+Two subjects of the same edit recipe (setting) form an analogy pair: one gives A / A', the other B / B', using the same set of applied edits. The edit prompt is built from the subject's edit texts.
 
 ---
 
 ## Project Structure
 
 ```
-visual_analogy/              # Core library (pip-installable)
-├── models/
-│   └── selective_lora.py       # AnaLoRALinear & ExLoRALinear
-└── utils/
-    ├── hf_utils.py             # HF cache resolution
-    └── selective_lora.py       # Injection, masking, save/load utilities
+sia/                         # Core library (pip-installable)
+├── lora.py                  # AnaLoRALinear & ExLoRALinear
+├── adapters.py              # Injection, masking, checkpoint save/load
+├── hf.py                    # Local-or-Hub checkpoint resolution
+├── klein_tokens.py          # FLUX.2-Klein token positions
+├── data.py / prompt.py      # Dataset and analogy prompt
+└── utils/qwen21.py          # Qwen-Image-2.1 token positions
 
 training/                    # Training & inference scripts
 ├── train_analora_flux2_klein.py       # AnaLoRA (Stage 1)
@@ -177,7 +162,7 @@ python training/infer_single.py \
     --output results/result.png
 ```
 
-The analogy prompt is built from `--edits`. By default the latest checkpoint in the config's `output_dir` is used; pass `--checkpoint_dir` to pick a specific one.
+The analogy prompt is built from `--edits`. By default the latest checkpoint in the config's `output_dir` is used; pass `--checkpoint_dir` to pick a specific one: a local directory or a Hub path such as `selective-image-analogy/SIA-weights/flux2_klein/exlora`.
 
 This generates a comparison strip showing: A | A' | B | analora | exlora (no suppression) | exlora (suppress e1) | exlora (suppress e2) | exlora (suppress all).
 
@@ -233,12 +218,38 @@ python training/_check_token_alignment.py
 
 ---
 
+## Qwen-Image-2.1 Backbone
+
+The same method (AnaLoRA → ExLoRA, CSV at inference) also runs on [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1). The pinned `requirements.txt` cannot load it, so install the overrides (a separate environment is simplest):
+
+```bash
+pip install -r requirements-qwen21.txt
+huggingface-cli download Qwen/Qwen-Image-2.1
+python training/_check_token_alignment_qwen21.py      # CPU, processor only
+```
+
+| Stage | Command |
+| --- | --- |
+| AnaLoRA | `accelerate launch --mixed_precision bf16 training/train_analora_qwen21.py --config training/configs/train_analora_qwen21.yaml` |
+| ExLoRA | `accelerate launch --mixed_precision bf16 training/train_exlora_qwen21.py --config training/configs/train_exlora_qwen21.yaml` |
+| Inference | `python training/infer_single_qwen21.py --config training/configs/train_exlora_qwen21.yaml ...` (same arguments as `infer_single.py`, plus `--resolution`, `--no_kv_cache`) |
+
+How the method maps onto Qwen-Image-2.1:
+
+- **Conditioning.** A, A', B are the pipeline's condition images `<image1..3>`: the Qwen3-VL encoder reads them together with the prompt, and their latents are placed in the transformer's sequence before the target, exactly as `QwenImage21Pipeline` does for multi-image editing. Images are resized with the pipeline's rule (`resolution²` area, own aspect ratio, sides multiple of 32); the configs use `resolution: 512` because the dataset images are 384×512.
+- **ExLoRA.** The transformer is single-stream, so there are no text-stream projections. ExLoRA wraps the shared attention and SwiGLU projections of every block (as AnaLoRA does) and its token mask gates it to the suppressed edit tokens of the joint text/image sequence. Because text tokens are modulated from t=0 (`causal_condition`), the ExLoRA update is step-independent and the prefix KV cache stays exact.
+- **Token mask / CSV.** Positions are rows of the Qwen3-VL output after image-slot expansion and system-prompt removal, mapped to the joint sequence for ExLoRA (`visual_analogy/utils/qwen21.py`). The CSV direction is built from that encoder path (`training/steering_dom_qwen21.py`); its cache defaults to `./steering_cache_qwen21`.
+- **Sampling.** As the pipeline: 40 steps, dynamic exponential shift, no CFG, prefix KV cache. A time-varying `embedding_schedule` turns the KV cache off, since the prompt embeddings then change every step.
+- **Training.** Each sample runs through the transformer on its own (gradients are averaged over `train_batch_size`), because batching prompts of different lengths would shift the target's RoPE positions relative to single-sample inference. Training sigmas get the sampler's resolution-dependent shift (`shift_train_sigmas`).
+
+---
+
 ## Config Options
 
 | Key                             | Description                                                    |
 | ------------------------------- | -------------------------------------------------------------- |
 | `pretrained_model_name_or_path` | Base model (default: `black-forest-labs/FLUX.2-klein-base-9B`) |
-| `data_root`                     | Path to the dataset (default: `data`)                          |
+| `dataset`                       | Hugging Face dataset id (default: the SIA dataset); `dataset_revision` pins a revision |
 | `output_dir`                    | Where checkpoints and logs are saved                           |
 | `analora_path`                  | Stage 1 checkpoint path (ExLoRA only)                          |
 | `lora_rank`                     | LoRA rank (default: `16`)                                      |

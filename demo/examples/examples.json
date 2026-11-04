@@ -1,0 +1,177 @@
+{
+  "source": {
+    "dataset": "selective-image-analogy/SIA-Multi-Edit-Analogy",
+    "config": "analogy_benchmark",
+    "split": "test",
+    "url": "https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy"
+  },
+  "license": "CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+  "attribution": "Images from the SIA Multi-Edit Analogy dataset (Alimohammadi et al., SIGGRAPH Asia 2026), CC BY-NC 4.0. Edited images were generated with FLUX.2 [klein] (https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B), subject to the FLUX Non-Commercial License. 2-edit recipes build on Relation252K (https://huggingface.co/datasets/handsomeWilliam/Relation252K, Apache-2.0).",
+  "changes": "None: images are the dataset's original PNGs, re-encoded losslessly.",
+  "kept_indexing": "0-based indices into edits",
+  "examples": [
+    {
+      "id": "3edits/setting10/data2",
+      "folder": "3edits__setting10__data2",
+      "edits": [
+        "add sweater",
+        "add santa hat",
+        "add street background"
+      ],
+      "edit_types": [
+        "object",
+        "object",
+        "background"
+      ],
+      "kept": [
+        0,
+        1
+      ],
+      "subject_type": "creature",
+      "recipe_in_train": false
+    },
+    {
+      "id": "3edits/setting3/data17",
+      "folder": "3edits__setting3__data17",
+      "edits": [
+        "add armor",
+        "add beach hat",
+        "add modern apartment kitchen background"
+      ],
+      "edit_types": [
+        "object",
+        "object",
+        "background"
+      ],
+      "kept": [
+        0,
+        2
+      ],
+      "subject_type": "creature",
+      "recipe_in_train": false
+    },
+    {
+      "id": "3edits/setting11/data4",
+      "folder": "3edits__setting11__data4",
+      "edits": [
+        "add golden armor",
+        "add Cowboy hat",
+        "add rolling green hills background"
+      ],
+      "edit_types": [
+        "object",
+        "object",
+        "background"
+      ],
+      "kept": [
+        1,
+        2
+      ],
+      "subject_type": "creature",
+      "recipe_in_train": false
+    },
+    {
+      "id": "3edits_non_creature/setting4/data9",
+      "folder": "3edits_non_creature__setting4__data9",
+      "edits": [
+        "add red T-shirt",
+        "sitting pose",
+        "add minimalist painting style"
+      ],
+      "edit_types": [
+        "object",
+        "pose",
+        "style"
+      ],
+      "kept": [
+        1,
+        2
+      ],
+      "subject_type": "non_creature",
+      "recipe_in_train": true
+    },
+    {
+      "id": "4edits/setting1/data2",
+      "folder": "4edits__setting1__data2",
+      "edits": [
+        "add a celestial diadem",
+        "add blue color hair",
+        "add empty festival japanese street background",
+        "add Van gogh style"
+      ],
+      "edit_types": [
+        "object",
+        "appearance",
+        "background",
+        "style"
+      ],
+      "kept": [
+        0,
+        1
+      ],
+      "subject_type": "creature",
+      "recipe_in_train": false
+    },
+    {
+      "id": "4edits/setting2/data4",
+      "folder": "4edits__setting2__data4",
+      "edits": [
+        "add scarf",
+        "add blond long hair wig",
+        "add inside of a store background",
+        "add black and white pencil style"
+      ],
+      "edit_types": [
+        "object",
+        "object",
+        "background",
+        "style"
+      ],
+      "kept": [
+        1,
+        3
+      ],
+      "subject_type": "creature",
+      "recipe_in_train": false
+    },
+    {
+      "id": "4edits/setting3/data2",
+      "folder": "4edits__setting3__data2",
+      "edits": [
+        "add blue scarf",
+        "add short white hair wig",
+        "add old cobblestone alley background",
+        "add black and white pencil style"
+      ],
+      "edit_types": [
+        "object",
+        "object",
+        "background",
+        "style"
+      ],
+      "kept": [
+        1,
+        2
+      ],
+      "subject_type": "creature",
+      "recipe_in_train": false
+    },
+    {
+      "id": "2edits_non_creature/setting3/data9",
+      "folder": "2edits_non_creature__setting3__data9",
+      "edits": [
+        "floating pose",
+        "add colored comic style"
+      ],
+      "edit_types": [
+        "pose",
+        "style"
+      ],
+      "kept": [
+        1
+      ],
+      "subject_type": "non_creature",
+      "recipe_in_train": true
+    }
+  ]
+}

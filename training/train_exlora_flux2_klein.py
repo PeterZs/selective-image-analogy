@@ -11,9 +11,9 @@ Architecture:
   - Selective-suppression loss: full analogy prompt + token mask over the
     edit phrases that should be suppressed; target image is the partial
     ``combined<retained>.png`` (paper §4.3, eq. 14).
-  - Multi-edit dataset (2/3/4 edits) read from ``<root>/<category>/<setting>
-    /<item>/`` with ``combinedN.png`` partial-target images and a
-    ``prompt.json`` listing every edit.
+  - Multi-edit dataset (2/3/4 edits) from the Hugging Face Hub
+    (``sia.data.SelectiveAnalogyDataset``): partial-edit target images and
+    the text of every edit.
 
 Usage:
   python training/train_exlora_flux2_klein.py \
@@ -25,7 +25,6 @@ import argparse
 import copy
 import inspect as _inspect
 import itertools
-import json
 import math
 import os
 import pickle
@@ -34,11 +33,6 @@ import re
 import sys
 import textwrap
 from pathlib import Path
-
-# Must set offline env vars BEFORE any HuggingFace imports.
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 # WandB is disabled when WANDB_MODE=disabled or WANDB_DISABLED=true.
 # Some GPU nodes have no wandb-core installed, so we skip
@@ -51,7 +45,7 @@ _USE_WANDB = (
 if _USE_WANDB:
     import wandb
 
-# Ensure the visual_analogy package (parent of this training/ dir) is importable
+# Ensure the sia package (parent of this training/ dir) is importable
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -62,39 +56,41 @@ from PIL import Image, ImageDraw, ImageFont
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
-# ── Now safe to import HF libraries ───────────────────────────────────────
 from accelerate import Accelerator
 from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, set_seed
 from diffusers import FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline
 from diffusers.models import AutoencoderKLFlux2, Flux2Transformer2DModel
 from diffusers.optimization import get_scheduler
+from diffusers.pipelines.flux2.pipeline_flux2_klein import retrieve_timesteps
 from diffusers.training_utils import (
     cast_training_params,
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
 )
+from huggingface_hub.constants import HF_HUB_OFFLINE
 from safetensors.torch import load_file
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
-from visual_analogy.models.selective_lora import ExLoRALinear, AnaLoRALinear
-from visual_analogy.utils import (
-    resolve_hf_snapshot_path,
-    save_exlora_state_dict,
-    save_analora_state_dict,
-    load_analora_state_dict,
-    exlora_token_mask_ctx,
-)
-from visual_analogy.utils.selective_lora import (
-    inject_exlora_modules,
-    inject_analora_modules,
-    load_analora_from_peft_checkpoint,
+from sia.data import DATASET, SelectiveAnalogyDataset, collate_selective, resize_to_match, subject_image
+from sia.adapters import (
     collect_analora_params,
     collect_exlora_params,
+    exlora_token_mask_ctx,
+    inject_analora_modules,
+    inject_exlora_modules,
+    load_analora_from_peft_checkpoint,
+    load_analora_state_dict,
+    load_exlora_state_dict,
+    save_analora_state_dict,
+    save_exlora_state_dict,
     set_analora_requires_grad,
     set_exlora_requires_grad,
-    klein_find_substring_token_indices,
 )
+from sia.hf import resolve_checkpoint
+from sia.klein_tokens import klein_find_substring_token_indices
+from sia.lora import AnaLoRALinear, ExLoRALinear
+from sia.prompt import build_analogy_prompt
 
 # ── Compatibility shim: strip unknown kwargs from set_module_tensor_to_device
 try:
@@ -135,50 +131,6 @@ EXLORA_TARGET_MODULES = [
 
 
 # ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-
-def resize_to_match(img, target_w, target_h):
-    """Resize image to (target_w, target_h), both divisible by 16."""
-    target_w = (target_w // 16) * 16
-    target_h = (target_h // 16) * 16
-    return img.resize((target_w, target_h), Image.LANCZOS)
-
-
-def resize_keep_ratio(img, max_side=512):
-    """Resize so the longer side equals max_side, rounding both sides to multiples of 16."""
-    w, h = img.size
-    scale = max_side / max(w, h)
-    new_w = max(16, round(w * scale / 16) * 16)
-    new_h = max(16, round(h * scale / 16) * 16)
-    if (w, h) != (new_w, new_h):
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-    return img
-
-
-def harmonize_images(a, a_prime, b, b_prime, max_side=512):
-    """Normalise all four images for training.
-
-    * A is resized to max_side (long-side) while preserving its aspect ratio,
-      rounded to multiples of 16.
-    * A' is snapped to A's exact pixel dimensions (same subject, same crop).
-    * B is resized independently with the same max_side / ratio rule so its
-      own aspect ratio is respected.
-    * B' is snapped to B's exact pixel dimensions so that the denoising target
-      always has the same spatial size as the B condition image.
-    """
-    a       = resize_keep_ratio(a, max_side)
-    a_w, a_h = a.size
-    a_prime = resize_to_match(a_prime, a_w, a_h)
-
-    b       = resize_keep_ratio(b, max_side)
-    b_w, b_h = b.size
-    b_prime = resize_to_match(b_prime, b_w, b_h)
-
-    return a, a_prime, b, b_prime
-
-
-# ---------------------------------------------------------------------------
 # Klein-specific helpers
 # ---------------------------------------------------------------------------
 
@@ -194,21 +146,6 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     return float(a * num_steps + b)
 
 
-def retrieve_timesteps(scheduler, num_inference_steps=None, device=None,
-                       timesteps=None, sigmas=None, **kwargs):
-    if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed.")
-    if timesteps is not None:
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        return scheduler.timesteps, len(scheduler.timesteps)
-    elif sigmas is not None:
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        return scheduler.timesteps, len(scheduler.timesteps)
-    else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        return scheduler.timesteps, num_inference_steps
-
-
 # ---------------------------------------------------------------------------
 # AnaLoRA target modules (same as analora training)
 # ---------------------------------------------------------------------------
@@ -222,466 +159,10 @@ ANALORA_TARGET_MODULES = [
 
 
 # ---------------------------------------------------------------------------
-# Helpers for the multi-edit (2/3/4) dataset layout
-# ---------------------------------------------------------------------------
-def _parse_combined_filename(filename: str):
-    """``combined123.png`` → ``[1, 2, 3]``; returns ``None`` if no match."""
-    m = re.match(r'combined(\d+)\.png$', filename)
-    if not m:
-        return None
-    return sorted(int(d) for d in m.group(1))
-
-
-def _get_combined_files(data_dir: Path):
-    """Return list of ``(filename, edit_indices)`` for every ``combined*.png``
-    in ``data_dir``."""
-    result = []
-    for f in data_dir.iterdir():
-        indices = _parse_combined_filename(f.name)
-        if indices is not None:
-            result.append((f.name, indices))
-    return result
-
-
-def _retained_tier_probs(n_tiers: int) -> list:
-    """Per-tier sampling probabilities for *retained* subsets in the ExLoRA
-    selective-suppression step. Longest (most retained) tier first.
-
-    1 → [1.0]
-    2 → [0.65, 0.35]   — small preference for "more kept" but enough
-                          mass on stronger suppression
-    3 → [0.55, 0.30, 0.15]
-    4+ → [0.50, 0.25, 0.25/(n-2), ...]
-    """
-    if n_tiers <= 1:
-        return [1.0] * max(n_tiers, 1)
-    if n_tiers == 2:
-        return [0.70, 0.20]
-    if n_tiers == 3:
-        return [0.70, 0.20, 0.10]
-    tail = 0.25 / (n_tiers - 2)
-    return [0.60, 0.15] + [tail] * (n_tiers - 2)
-
-
-def _sample_retained_subset(partial_files: list):
-    """Pick one ``(filename, indices)`` from a list of available partial
-    combined files, biased toward subsets that keep more edits."""
-    if not partial_files:
-        return None
-    tier_dict: dict = {}
-    for fname, indices in partial_files:
-        tier_dict.setdefault(len(indices), []).append((fname, indices))
-    sorted_tiers = sorted(tier_dict.keys(), reverse=True)
-    probs = _retained_tier_probs(len(sorted_tiers))
-    chosen_tier = random.choices(sorted_tiers, weights=probs)[0]
-    return random.choice(tier_dict[chosen_tier])
-
-
-# ---------------------------------------------------------------------------
-# Dataset — multi-edit (2/3/4) layout with combinedN.png + prompt.json
-# ---------------------------------------------------------------------------
-
-class ImageAnalogyDataset(Dataset):
-    """Selective image analogy dataset for ExLoRA training (Flux2-Klein).
-
-    Directory layout (Selective Image Analogy multi-edit dataset)::
-
-        <data_root>/
-            <category>/                 # e.g. 2edits_non_creature | 3_edits |
-                                        #      3edits_non_creature | 4edits
-                <setting>/              # setting1 | setting2 | …
-                    <item>/             # e.g. 1, 2, … (distinct subjects/items)
-                        input.png           → original ``I^{∅}`` (A or B)
-                        combined1.png       → image with edit 1 only
-                        combined12.png      → image with edits 1+2
-                        combined123.png     → image with edits 1+2+3
-                        combined1234.png    → image with edits 1+2+3+4 (when N=4)
-                        combinedXY.png      → any other available subset
-                        prompt.json         → ``{"edit1": …, "edit2": …, …, "editN": …}``
-
-    Each item is stored as a dict with:
-
-    * ``input``    — path to ``input.png``
-    * ``edits``    — ``{1: "text1", 2: "text2", …}`` (1-based int keys)
-    * ``combined`` — ``{frozenset({1,2}): path, frozenset({1}): path, …}``
-    * ``dir``      — item directory path string
-
-    Sampling produces an analogy pair ``(item_a, item_b)`` from the same
-    ``<category>/<setting>`` and selects a ``(demo_set, kept_set)`` pair
-    where both combined images exist in both items and ``kept_set`` is a
-    strict proper non-empty subset of ``demo_set``.  The suppression set is
-    ``suppress_set = demo_set − kept_set``.
-
-    * ``A``, ``B``          — input images
-    * ``A_prime``           — ``item_a``'s ``combined[demo_set]`` (the demo A')
-    * ``A_prime_total``     — same as ``A_prime``
-    * ``A_prime_partial``   — ``item_a``'s ``combined[kept_set]`` if available,
-                              else ``None`` (trainer falls back to ``A_prime``)
-    * ``B_prime``           — ``item_b``'s ``combined[kept_set]`` (partial target
-                              B'_R); equals ``B`` when ``kept_set`` is empty
-                              (all-suppress fallback)
-    * ``B_total``           — ``item_b``'s ``combined[demo_set]`` (full demo B')
-    * ``pair_a_edits``      — list of edit strings for the *demo* edits, in
-                              ``demo_set`` index order; length = ``|demo_set|``
-    * ``suppress_indices``  — 0-based indices into ``pair_a_edits`` of edits
-                              that are suppressed (``suppress_set`` positions)
-    * ``suppress_edit_texts`` — the actual edit-text strings for every
-                              suppressed edit (``[pair_a_edits[i] for i in
-                              suppress_indices]``); always a list, never a
-                              single string
-
-    Demo sets are weighted by ``|demo_set|³`` so the model sees larger (more
-    complete) demonstrations most of the time, matching §4.3 of the SIA paper.
-    When no valid ``(demo, kept)`` pair exists across both items, the largest
-    common demo is used with ``kept_set = ∅`` (all-suppress fallback).
-
-    Notes
-    -----
-    * Items with fewer than 2 edits or no ``combined*.png`` on disk are
-      skipped at construction time.
-    * The ``_load_item`` static method handles per-item parsing and can be
-      reused by subclasses or external tooling.
-    """
-
-    def __init__(self, data_root):
-        self.data_root = Path(data_root)
-        self.categories: dict = {}
-        n_total = 0
-        n_skipped = 0
-
-        for cat_dir in sorted(self.data_root.iterdir()):
-            if not cat_dir.is_dir():
-                continue
-            cat = cat_dir.name
-            self.categories[cat] = {}
-
-            for setting_dir in sorted(cat_dir.iterdir()):
-                if not setting_dir.is_dir():
-                    continue
-                setting = setting_dir.name
-                items = []
-
-                for item_dir in sorted(setting_dir.iterdir()):
-                    if not item_dir.is_dir():
-                        continue
-                    info = self._load_item(item_dir)
-                    if info is None:
-                        n_skipped += 1
-                        continue
-                    items.append(info)
-                    n_total += 1
-
-                if len(items) >= 2:
-                    self.categories[cat][setting] = items
-
-        self.cat_names = sorted(self.categories.keys())
-        print(f"ExLoRA ImageAnalogyDataset: {len(self.cat_names)} categories, "
-              f"{n_total} items kept ({n_skipped} skipped).")
-        for cat in self.cat_names:
-            n = sum(len(items) for items in self.categories[cat].values())
-            print(f"  {cat}: {len(self.categories[cat])} settings, {n} items")
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _load_item(item_dir: Path):
-        """Parse one item directory.  Returns None when the item is invalid."""
-        input_path  = item_dir / 'input.png'
-        prompt_file = item_dir / 'prompt.json'
-        if not (input_path.exists() and prompt_file.exists()):
-            return None
-        try:
-            prompt_dict = json.loads(prompt_file.read_text())
-        except Exception:
-            return None
-
-        # Build 1-based edits dict from 'edit1', 'edit2', ... keys.
-        edits: dict = {}
-        for k, v in prompt_dict.items():
-            m = re.fullmatch(r'edit(\d+)', k)
-            if m and v and (v_stripped := v.strip()):
-                edits[int(m.group(1))] = v_stripped
-
-        if len(edits) < 2:
-            return None
-
-        # Build combined_map: frozenset(indices) → absolute path.
-        # Only include combined files whose indices are all valid edit indices.
-        valid_indices = set(edits.keys())
-        combined_map: dict = {}
-        for f in sorted(item_dir.iterdir()):
-            indices_list = _parse_combined_filename(f.name)
-            if indices_list is None:
-                continue
-            fs = frozenset(indices_list)
-            if fs and fs.issubset(valid_indices):
-                combined_map[fs] = str(f)
-
-        if not combined_map:
-            return None
-
-        return {
-            'input':    str(input_path),
-            'edits':    edits,        # {1: "text1", 2: "text2", …}
-            'combined': combined_map, # {frozenset(indices): path}
-            'dir':      str(item_dir),
-        }
-
-    # ------------------------------------------------------------------
-    def __len__(self):
-        return sum(len(items) for c in self.categories.values()
-                   for items in c.values())
-
-    # ------------------------------------------------------------------
-    def _sample_two_items(self):
-        """Pick a category/setting and two distinct items from that setting.
-
-        Categories are picked uniformly at random; settings are picked
-        uniformly within a category; items are picked without replacement
-        within a setting. Settings with < 2 items are excluded.
-        """
-        cat = random.choice(self.cat_names)
-        settings_with_pairs = [
-            s for s, items in self.categories[cat].items() if len(items) >= 2
-        ]
-        if not settings_with_pairs:
-            # Fall back to any category that has at least one usable setting.
-            valid_cats = [
-                c for c in self.cat_names
-                if any(len(items) >= 2 for items in self.categories[c].values())
-            ]
-            cat = random.choice(valid_cats)
-            settings_with_pairs = [
-                s for s, items in self.categories[cat].items() if len(items) >= 2
-            ]
-        setting = random.choice(settings_with_pairs)
-        items = self.categories[cat][setting]
-        item_a, item_b = random.sample(items, 2)
-        return cat, setting, item_a, item_b
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _pick_demo_kept(common_sets):
-        """Sample a ``(demo_set, kept_set)`` pair from combined sets present
-        in both items.
-
-        All valid pairs ``(demo, kept)`` where ``kept`` is a non-empty proper
-        subset of ``demo`` are enumerated.  Pairs are weighted by
-        ``|demo|³`` to strongly prefer larger (more complete) demos.
-        Falls back to ``(largest_demo, frozenset())`` when no strict-subset
-        pair exists (all-suppress branch).
-
-        Returns ``(demo_set, kept_set)`` — both frozensets.
-        """
-        valid_pairs = [
-            (demo, kept)
-            for demo in common_sets
-            for kept in common_sets
-            if len(kept) > 0 and kept < demo   # strict proper subset
-        ]
-        if valid_pairs:
-            weights = [len(demo) ** 3 for demo, _ in valid_pairs]
-            return random.choices(valid_pairs, weights=weights, k=1)[0]
-        # No valid partial pair — use the largest common combined as the
-        # demo, leave kept empty (all-suppress fallback).
-        demo_set = max(common_sets, key=lambda s: (len(s), tuple(sorted(s))))
-        return demo_set, frozenset()
-
-    # ------------------------------------------------------------------
-    def sample_val_pair(self):
-        """Return a dict of paths + metadata for use in validation."""
-        cat, setting, item_a, item_b = self._sample_two_items()
-
-        a_edits    = item_a['edits']
-        a_combined = item_a['combined']
-        b_combined = item_b['combined']
-
-        common_sets = set(a_combined) & set(b_combined)
-        demo_set, kept_set = self._pick_demo_kept(common_sets)
-        suppress_set = demo_set - kept_set
-
-        demo_indices     = sorted(demo_set)
-        kept_indices     = sorted(kept_set)
-        suppress_indices = sorted(suppress_set)
-
-        demo_edit_texts = [a_edits[i] for i in demo_indices if i in a_edits]
-
-        # Positional 1-based indices within demo_edit_texts (used by the
-        # validation code which does ``i - 1`` to get 0-based positions).
-        demo_idx_to_pos1 = {idx: pos + 1 for pos, idx in enumerate(demo_indices)}
-        retained_indices_1b = [demo_idx_to_pos1[i] for i in kept_indices
-                                if i in demo_idx_to_pos1]
-        suppress_indices_1b = [demo_idx_to_pos1[i] for i in suppress_indices
-                                if i in demo_idx_to_pos1]
-
-        a_demo_path  = a_combined[demo_set]
-        b_demo_path  = b_combined[demo_set]
-        b_kept_path  = b_combined.get(kept_set) if kept_set else None
-        a_kept_path  = a_combined.get(kept_set) if kept_set else None
-
-        return {
-            'a_path':               item_a['input'],
-            'a_prime_total_path':   a_demo_path,
-            'a_prime_partial_path': a_kept_path,
-            'b_path':               item_b['input'],
-            'b_prime_total_path':   b_demo_path,
-            # Fall back to demo when no kept image exists (all-suppress case).
-            'b_prime_partial_path': b_kept_path if b_kept_path else b_demo_path,
-            'all_indices_1b':       list(range(1, len(demo_indices) + 1)),
-            'retained_indices_1b':  retained_indices_1b,
-            'suppress_indices_1b':  suppress_indices_1b,
-            'pair_a_edits':         demo_edit_texts,
-            'pair_b_edits':         demo_edit_texts,
-            'edit_name':            f"{cat}/{setting}",
-        }
-
-    # ------------------------------------------------------------------
-    def __getitem__(self, idx):
-        for _ in range(8):
-            sample = self._try_sample()
-            if sample is not None:
-                return sample
-        raise RuntimeError(
-            "Failed to sample a valid analogy pair after 8 attempts.")
-
-    # ------------------------------------------------------------------
-    def _try_sample(self):
-        cat, setting, item_a, item_b = self._sample_two_items()
-
-        a_edits    = item_a['edits']
-        a_combined = item_a['combined']
-        b_combined = item_b['combined']
-
-        common_sets = set(a_combined) & set(b_combined)
-        if not common_sets:
-            return None
-
-        demo_set, kept_set = self._pick_demo_kept(common_sets)
-        suppress_set = demo_set - kept_set
-
-        # ---- Load images ----
-        a_img      = Image.open(item_a['input']).convert('RGB')
-        b_img      = Image.open(item_b['input']).convert('RGB')
-        a_demo_img = Image.open(a_combined[demo_set]).convert('RGB')
-        b_demo_img = Image.open(b_combined[demo_set]).convert('RGB')
-
-        if kept_set:
-            b_kept_img = Image.open(b_combined[kept_set]).convert('RGB')
-            # A's matching partial for the AnaLoRA-partial step (may be absent).
-            a_kept_img = (Image.open(a_combined[kept_set]).convert('RGB')
-                          if kept_set in a_combined else None)
-        else:
-            b_kept_img = None
-            a_kept_img = None
-
-        # ---- Harmonize sizes ----
-        a_img, a_demo_img, b_img, b_demo_img = harmonize_images(
-            a_img, a_demo_img, b_img, b_demo_img, max_side=512)
-        if b_kept_img is not None:
-            b_kept_img = resize_to_match(b_kept_img, *b_img.size)
-        if a_kept_img is not None:
-            a_kept_img = resize_to_match(a_kept_img, *a_img.size)
-
-        # ---- Build edit text lists ----
-        demo_indices     = sorted(demo_set)
-        suppress_indices = sorted(suppress_set)
-
-        # demo_edit_texts: one entry per demo edit, in index order.
-        # suppress_edit_texts: sub-list for edits being suppressed — every
-        # edit in suppress_set gets its own entry (never collapsed to one).
-        demo_edit_texts     = [a_edits[i] for i in demo_indices if i in a_edits]
-        suppress_edit_texts = [a_edits[i] for i in suppress_indices if i in a_edits]
-
-        if not demo_edit_texts:
-            return None
-
-        # 0-based positions within demo_edit_texts for the suppressed edits.
-        demo_idx_to_pos = {idx: pos for pos, idx in enumerate(demo_indices)}
-        suppress_indices_0b = [demo_idx_to_pos[i] for i in suppress_indices
-                               if i in demo_idx_to_pos]
-
-        # B_prime: partial target (kept edits only); B itself when all-suppress.
-        b_prime = b_kept_img if b_kept_img is not None else b_img
-
-        combined_prompt = build_analogy_prompt(demo_edit_texts, demo_edit_texts)
-
-        return {
-            'A':                   a_img,
-            'A_prime':             a_demo_img,  # demo A' (same as A_prime_total)
-            'A_prime_total':       a_demo_img,
-            'A_prime_partial':     a_kept_img,  # matched partial A', or None
-            'B':                   b_img,
-            'B_prime':             b_prime,     # partial target B'_R
-            'B_total':             b_demo_img,  # full demo B' (AnaLoRA total step)
-            'edit_name':           f"{cat}/{setting}",
-            'prompt':              combined_prompt,
-            'pair_a_edits':        demo_edit_texts,
-            'pair_b_edits':        demo_edit_texts,
-            # 0-based positions in pair_a_edits for the edits being suppressed.
-            'suppress_indices':    suppress_indices_0b,
-            # Actual text strings for ALL suppressed edits (one per edit, not
-            # collapsed) — used directly by build_token_mask without re-indexing.
-            'suppress_edit_texts': suppress_edit_texts,
-        }
-
-
-def collate_fn(batch):
-    return {
-        'A':                   [item['A']                   for item in batch],
-        'A_prime':             [item['A_prime']             for item in batch],
-        'A_prime_total':       [item['A_prime_total']       for item in batch],
-        'A_prime_partial':     [item['A_prime_partial']     for item in batch],
-        'B':                   [item['B']                   for item in batch],
-        'B_prime':             [item['B_prime']             for item in batch],
-        'B_total':             [item['B_total']             for item in batch],
-        'prompts':             [item['prompt']              for item in batch],
-        'pair_a_edits':        [item['pair_a_edits']        for item in batch],
-        'pair_b_edits':        [item['pair_b_edits']        for item in batch],
-        # 0-based positions in pair_a_edits; each entry is a list (multi-edit).
-        'suppress_indices':    [item['suppress_indices']    for item in batch],
-        # Actual suppressed edit strings per sample — list[list[str]].
-        'suppress_edit_texts': [item['suppress_edit_texts'] for item in batch],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Prompt helpers
-# ---------------------------------------------------------------------------
-
-def build_analogy_prompt(pair_a_edits, pair_b_edits, suppress_indices=None):
-    """Build the concat-mode analogy prompt for an arbitrary number of edits.
-
-    Supports N∈{2,3,4} (and beyond) by simply iterating over ``pair_a_edits``.
-    Follows the same format as train_analora_flux2_klein.py: only the A
-    pair edits are listed (the model infers B→B' by analogy).
-
-    Args:
-        pair_a_edits: list of edit strings for A→A' (length = number of edits).
-        pair_b_edits: list of edit strings for B→B' (unused in prompt, kept
-            for API compatibility).
-        suppress_indices: iterable of 0-based indices into ``pair_a_edits`` to
-            omit from the listing (``None`` = keep all).
-
-    Returns:
-        Prompt string. The listed edit numbers in the output are renumbered
-        contiguously after suppression (Edit 1, Edit 2, …) so the visible
-        prompt never references an omitted edit.
-    """
-    suppress = set(suppress_indices or [])
-    kept = [e for i, e in enumerate(pair_a_edits) if i not in suppress and e]
-    edits_part = " ".join(f"Edit {n + 1}: {e}." for n, e in enumerate(kept))
-    return (
-        "Image 1 is the original and image 2 is the edited version. "
-        f"{edits_part} "
-        "Apply the same edits to image 3 to produce the output."
-    )
-
-
-# ---------------------------------------------------------------------------
 # Token mask helpers (Qwen/Flux2 tokenizer)
 # ---------------------------------------------------------------------------
 
-def build_token_mask(full_prompt, edit_texts, tokenizer, device,
-                     max_seq_len=512, use_chat_template: bool = True):
+def build_token_mask(full_prompt, edit_texts, tokenizer, device, max_seq_len=512):
     """Build a (1, max_seq_len) bool mask covering tokens for each edit text.
 
     The mask is aligned against the **chat-templated** Qwen prompt — the
@@ -696,8 +177,6 @@ def build_token_mask(full_prompt, edit_texts, tokenizer, device,
         tokenizer:    Qwen2TokenizerFast
         device:       target device
         max_seq_len:  must match max_length used in prompt encoding
-        use_chat_template: kept as an escape hatch for forensic runs only.
-            ``True`` (default) is the only correct setting for Flux2-Klein.
 
     Returns:
         torch.BoolTensor of shape (1, max_seq_len). If a particular edit
@@ -712,7 +191,6 @@ def build_token_mask(full_prompt, edit_texts, tokenizer, device,
             indices = klein_find_substring_token_indices(
                 full_prompt, text, tokenizer,
                 max_length=max_seq_len,
-                use_chat_template=use_chat_template,
             )
         except AssertionError as exc:
             # Substring not found in the prompt — almost always an edit-text
@@ -741,20 +219,17 @@ def build_token_mask(full_prompt, edit_texts, tokenizer, device,
 # ---------------------------------------------------------------------------
 
 def load_models(args):
-    local_path = resolve_hf_snapshot_path(args.pretrained_model_name_or_path)
+    path = args.pretrained_model_name_or_path
     # The frozen models are cast to bf16 in main() anyway; loading them in bf16
     # avoids a ~70 GB fp32 copy in host RAM (the LoRA layers stay fp32).
-    bf16 = dict(local_files_only=True, torch_dtype=torch.bfloat16)
-    tokenizer = Qwen2TokenizerFast.from_pretrained(
-        local_path, subfolder="tokenizer", local_files_only=True)
-    text_encoder = Qwen3ForCausalLM.from_pretrained(
-        local_path, subfolder="text_encoder", **bf16)
-    vae = AutoencoderKLFlux2.from_pretrained(
-        local_path, subfolder="vae", **bf16)
-    transformer = Flux2Transformer2DModel.from_pretrained(
-        local_path, subfolder="transformer", **bf16)
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        local_path, subfolder="scheduler", local_files_only=True)
+    # diffusers 0.38 queries the Hub for sharded weights unless local_files_only is
+    # set, so HF_HUB_OFFLINE=1 is passed on explicitly.
+    bf16 = dict(torch_dtype=torch.bfloat16, local_files_only=HF_HUB_OFFLINE)
+    tokenizer = Qwen2TokenizerFast.from_pretrained(path, subfolder="tokenizer")
+    text_encoder = Qwen3ForCausalLM.from_pretrained(path, subfolder="text_encoder", **bf16)
+    vae = AutoencoderKLFlux2.from_pretrained(path, subfolder="vae", **bf16)
+    transformer = Flux2Transformer2DModel.from_pretrained(path, subfolder="transformer", **bf16)
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
     return tokenizer, text_encoder, vae, transformer, noise_scheduler
 
 
@@ -789,11 +264,24 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 # Latent helpers
 # ---------------------------------------------------------------------------
 
+def _native_wh():
+    """(w, h) from env SIA_NATIVE_RES ("1" -> 384x512, "WxH"), or None for the square 512 recipe."""
+    v = os.environ.get("SIA_NATIVE_RES", "0")
+    if v in ("", "0"):
+        return None
+    w, h = (384, 512) if v == "1" else map(int, v.lower().split("x"))
+    return w // 16 * 16, h // 16 * 16
+
+
 @torch.no_grad()
 def encode_single_image(pipe, img, cell_size=512):
-    """Resize, preprocess, and VAE-encode a single PIL image. Returns (1, C, h, w) latent."""
-    img = resize_to_match(img, cell_size, cell_size)
-    tensor = pipe.image_processor.preprocess(img, cell_size, cell_size)
+    """Resize, preprocess, and VAE-encode a single PIL image. Returns (1, C, h, w) latent.
+
+    With SIA_NATIVE_RES set (1 = 384x512, or "WxH") every image is encoded at that fixed
+    non-square size instead of cell_size x cell_size (our data is 384x512 portrait)."""
+    w, h = _native_wh() or (cell_size, cell_size)
+    img = resize_to_match(img, w, h)
+    tensor = pipe.image_processor.preprocess(img, h, w)   # height first
     tensor = tensor.to(device=pipe._execution_device, dtype=torch.bfloat16)
     return pipe._encode_vae_image(tensor, generator=None)
 
@@ -950,15 +438,7 @@ def get_load_model_hook(accelerator):
         assert len(models) == 1, "Only transformer should be in the models list."
         transformer = models.pop()
 
-        # Load ExLoRA weights
-        exlora_path = os.path.join(input_dir, "selective_lora.pt")
-        state = torch.load(exlora_path, map_location=accelerator.device)
-        missing, unexpected = transformer.load_state_dict(state, strict=False)
-        if unexpected:
-            raise ValueError(f"Unexpected keys when loading ExLoRA: {unexpected}")
-        print(f"[Resume] Loaded ExLoRA weights ({len(missing)} missing keys).")
-
-        # Load AnaLoRA weights
+        load_exlora_state_dict(transformer, os.path.join(input_dir, "selective_lora.pt"))
         analora_path = os.path.join(input_dir, "base_lora.pt")
         if os.path.exists(analora_path):
             load_analora_state_dict(transformer, analora_path, accelerator.device)
@@ -988,9 +468,6 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
 
     The "all suppressed -> expect B" sanity-check column has been removed
     entirely (not computed, not displayed).
-
-    Only this function was modified; ImageAnalogyDataset is used purely
-    via its public attributes (no changes there).
     """
     print(f"Running ExLoRA analogy validation at step {global_step}...")
 
@@ -1030,8 +507,8 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
     # position within pair_a_edits.
     demo_idx_to_pos = {idx: pos for pos, idx in enumerate(demo_indices)}
 
-    a_demo_path = a_combined[demo_set]
-    b_demo_path = b_combined[demo_set]
+    a_demo_ref = a_combined[demo_set]
+    b_demo_ref = b_combined[demo_set]
 
     # ------------------------------------------------------------------
     # 3) Enumerate ALL 2^n subsets of demo_indices as kept_set candidates.
@@ -1046,10 +523,10 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
     prompt = build_analogy_prompt(pair_a_edits, pair_b_edits)
 
     val_sample = {
-        'A':       Image.open(item_a['input']).convert('RGB'),
-        'A_prime': Image.open(a_demo_path).convert('RGB'),
-        'B':       Image.open(item_b['input']).convert('RGB'),
-        'B_total': Image.open(b_demo_path).convert('RGB'),  # B' GT (all edits)
+        'A':       subject_image(train_dataset.subjects, item_a['input']),
+        'A_prime': subject_image(train_dataset.subjects, a_demo_ref),
+        'B':       subject_image(train_dataset.subjects, item_b['input']),
+        'B_total': subject_image(train_dataset.subjects, b_demo_ref),  # B' GT (all edits)
         'edit_name': edit_name,
         'prompt':    prompt,
     }
@@ -1157,8 +634,7 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
     # ------------------------------------------------------------------
     # Shared header-row images (computed once, shown only at the very top).
     # ------------------------------------------------------------------
-    target_w = 512
-    target_h = 512
+    target_w, target_h = _native_wh() or (512, 512)
 
     def resize_img(img):
         return resize_to_match(img, target_w, target_h)
@@ -1172,10 +648,10 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
 
     def load_combined(combined_map, fset):
         """Return PIL image for combined_map[fset] if present, else None."""
-        path = combined_map.get(fset)
-        if path is None:
+        ref = combined_map.get(fset)
+        if ref is None:
             return None
-        return Image.open(path).convert('RGB')
+        return subject_image(train_dataset.subjects, ref)
 
     # ------------------------------------------------------------------
     # Pre-compute per-kept_set metadata (GT image, suppressed prompt, etc.)
@@ -1195,7 +671,7 @@ def log_analogy_validation(pipeline, train_dataset, tokenizer, text_encoder,
 
         # B' ground truth for this kept_set.
         if kept_set == demo_set:
-            b_prime_gt_img = Image.open(b_demo_path).convert('RGB')
+            b_prime_gt_img = subject_image(train_dataset.subjects, b_demo_ref)
         elif not kept_set:
             b_kept_img = load_combined(b_combined, kept_set)
             b_prime_gt_img = b_kept_img if b_kept_img is not None else val_sample['B']
@@ -1451,7 +927,7 @@ def main():
 
     # ---- Load pre-trained AnaLoRA weights from PEFT checkpoint ----
     load_analora_from_peft_checkpoint(
-        transformer, args.analora_path, device="cpu")
+        transformer, resolve_checkpoint(args.analora_path), device="cpu")
 
     # ---- Inject ExLoRA on context targets (wraps AnaLoRALinear where applicable) ----
     replaced = inject_exlora_modules(
@@ -1504,11 +980,11 @@ def main():
     )
 
     # ---- Dataset & dataloader ----
-    train_dataset = ImageAnalogyDataset(args.data_root)
+    train_dataset = SelectiveAnalogyDataset(args.get("dataset", DATASET), args.get("dataset_revision"))
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
-        collate_fn=collate_fn,
+        collate_fn=collate_selective,
         num_workers=2,
         shuffle=True,
     )
@@ -1582,9 +1058,6 @@ def main():
     unwrapped_transformer = accelerator.unwrap_model(transformer)
 
     transformer.train()
-
-    analora_step_ratio = getattr(args, "analora_step_ratio", 0.333)
-    print(f"[Training] analora_step_ratio = {analora_step_ratio}")
 
     # ====================================================================
     # Training loop

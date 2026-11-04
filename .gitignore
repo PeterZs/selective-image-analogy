@@ -40,9 +40,13 @@ data/
 
 # Steering vector cache
 steering_cache/
+steering_cache_qwen21/
 
 # Images
 *.png
 
 # Inference outputs
 results/
+
+# Demo example images (credited in demo/examples/examples.json)
+!demo/examples/**/*.png

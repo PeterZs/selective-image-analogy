@@ -1,0 +1,63 @@
+tracker_name: visual-analogy
+wandb_run_name: "exlora_qwen21_analogy_selective"
+
+output_dir: "experiments/exlora_qwen21"
+
+# Stage 1 (AnaLoRA) checkpoint loaded before injecting ExLoRA: a local dir or a Hub path,
+# e.g. selective-image-analogy/SIA-weights/qwen_image21/analora
+analora_path: "experiments/analora_qwen21/checkpoint-15000"
+
+pretrained_model_name_or_path: "Qwen/Qwen-Image-2.1"
+
+# Training data: Hugging Face dataset id and optional revision (branch, tag or commit).
+dataset: "selective-image-analogy/SIA-Multi-Edit-Analogy"
+dataset_revision: null
+
+# Target area is resolution^2 at each image's own aspect ratio, sides
+# multiples of 32 (QwenImage21Pipeline rule). Use the same value at inference
+# (infer_single_qwen21.py --resolution).
+resolution: 512
+
+seed: 0
+checkpointing_steps: 500
+validation_steps: 100
+
+# QwenImage21Pipeline default: 40 steps, no CFG, prefix KV cache on.
+num_val_inference_steps: 40
+use_kv_cache: true
+
+lora_rank: 16
+lora_dropout: 0.0
+
+resume_from_checkpoint: true
+max_train_steps: 20000
+
+lr_warmup_steps: 0
+learning_rate: 5e-5
+analora_learning_rate: 5e-5
+analora_anchor_weight: 0.1
+# Effective batch per optimizer step; samples run one at a time.
+train_batch_size: 18
+gradient_accumulation_steps: 1
+max_grad_norm: 1
+
+# One sample per transformer pass already saturates the GPU at 512 (batching
+# does not raise throughput), so spare VRAM is better spent here: off is ~26 %
+# faster and peaks at ~68 GiB. Turn it on for resolution 1024 or GPUs < 80 GB.
+gradient_checkpointing: false
+
+weighting_scheme: "none"
+shift_train_sigmas: true
+
+# Unseen-data visualisation (no ground truth): fixed (A, A', B) cases from the
+# dataset's analogy_benchmark test split, rendered with ExLoRA suppressing every
+# subset of the edits. Runs once before training and every benchmark_steps.
+# All but the last case use edit recipes absent from training.
+benchmark_steps: 250
+benchmark_ids:
+  - "2edits/data10"
+  - "2edits/data11"
+  - "3edits/setting10/data1"
+  - "3edits/setting9/data1"
+  - "4edits/setting1/data3"
+  - "3edits_non_creature/setting2/data1"
