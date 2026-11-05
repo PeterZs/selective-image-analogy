@@ -8,7 +8,7 @@
 
 <sup>1</sup>Simon Fraser University &nbsp; <sup>2</sup>University of Cyprus &nbsp; <sup>3</sup>Shahid Beheshti University &nbsp; <sup>4</sup>CYENS Centre of Excellence<br><sup>*</sup>Equal contribution
 
-[![Project Page](https://img.shields.io/badge/Project-Page-2ea44f)](https://selective-image-analogy.github.io/) [![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b)](#) [![Video](https://img.shields.io/badge/Video-YouTube-red?logo=youtube)](https://www.youtube.com/watch?v=HU010YnVEwI) [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-Multi--Edit%20Analogy-yellow)](https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy) [![Weights](https://img.shields.io/badge/%F0%9F%A4%97%20Weights-SIA--weights-yellow)](https://huggingface.co/selective-image-analogy/SIA-weights)
+[![Project Page](https://img.shields.io/badge/Project-Page-2ea44f)](https://selective-image-analogy.github.io/) [![Demo](https://img.shields.io/badge/%F0%9F%A4%97%20Demo-Try%20it-blue)](https://amirhossein-alimohammadi-selective-image-analogy.hf.space/) [![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b)](#) [![Video](https://img.shields.io/badge/Video-YouTube-red?logo=youtube)](https://www.youtube.com/watch?v=HU010YnVEwI) [![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-Multi--Edit%20Analogy-yellow)](https://huggingface.co/datasets/selective-image-analogy/SIA-Multi-Edit-Analogy) [![Weights](https://img.shields.io/badge/%F0%9F%A4%97%20Weights-SIA--weights-yellow)](https://huggingface.co/selective-image-analogy/SIA-weights)
 
 <img src="https://selective-image-analogy.github.io/static/figures/teaser.svg" alt="SIA teaser: one demonstration pair with three edits; SIA transfers any chosen subset of them to a new image" width="100%">
 
@@ -201,7 +201,7 @@ The tests run on CPU. Tests that need a backbone's tokenizer or the dataset are 
 
 ## Demo
 
-`demo/` is the Gradio app of the Hugging Face Space (Qwen-Image-2.1, `qwen_image21/exlora` weights, no CSV). Hugging Face Space: coming soon.
+Try SIA in the browser on the [Hugging Face Space](https://amirhossein-alimohammadi-selective-image-analogy.hf.space/). `demo/` is its Gradio app (Qwen-Image-2.1, `qwen_image21/exlora` weights, no CSV).
 
 ## License
 
