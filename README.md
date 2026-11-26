@@ -214,13 +214,16 @@ Try SIA in the browser on the [Hugging Face Space](https://amirhossein-alimohamm
 ```bibtex
 @inproceedings{alimohammadi2026sia,
   title     = {SIA: Selective Image Analogy},
-  author    = {Alimohammadi, Amir and Izadpanah, Kian and
+  author    = {Alimohammadi, Amirhossein and Izadpanah, Kian and
                Kariminia, Bardiya and Chrysanthou, Yiorgos and
                Mahdavi-Amiri, Ali},
-  booktitle = {SIGGRAPH Asia 2026 Conference Papers},
+  booktitle = {Proceedings of the SIGGRAPH Asia 2026 Conference Papers},
   year      = {2026},
   publisher = {Association for Computing Machinery},
-  doi       = {10.1145/3829340.3842205}
+  doi       = {10.1145/3829340.3842205},
+  eprint        = {2611.33894},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV}
 }
 ```
 
